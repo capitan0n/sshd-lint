@@ -7,15 +7,18 @@
 # Date:         July 2026
 # ==============================================================================
 """
-sshd_lint.py — Static analyzer for sshd_config files.
+sshd_lint — Static analyzer for sshd_config files.
 
 Usage:
-    python sshd_lint.py
-    python sshd_lint.py /path/to/sshd_config
-    python sshd_lint.py sshd_config --severity high
-    python sshd_lint.py sshd_config --format json
-    python sshd_lint.py sshd_config --openssh-version 8.9
-    python sshd_lint.py sshd_config --base-dir /etc/ssh
+    sshd-lint
+    sshd-lint /path/to/sshd_config
+    sshd-lint sshd_config --severity high
+    sshd-lint sshd_config --format json
+    sshd-lint sshd_config --openssh-version 8.9
+    sshd-lint sshd_config --base-dir /etc/ssh
+
+    # Without installing, from a source checkout:
+    python -m sshd_lint /path/to/sshd_config
 
 References used in rules:
     - CIS Benchmark for Linux (SSH section)
@@ -33,7 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # Raw string: the art contains backslashes that must not be read as escapes.
 # Kept at 51 columns so it never wraps on an 80-column terminal.

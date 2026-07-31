@@ -24,7 +24,7 @@ AI was used for code generation, logic refinement, and edge-case handling (such 
 
 ## ✨ Features
 
-- **Zero Dependencies** — Built entirely on the Python standard library. No `pip install`.
+- **Zero Runtime Dependencies** — Built entirely on the Python standard library. Installs with a single `pip install`, then runs with nothing else — no third-party packages pulled in.
 - **Context-Aware Parsing** — Understands OpenSSH semantics: `Match` blocks, `Match All` reset, directive shadowing, and `Include` glob expansion.
 - **Scoped Match Block Findings** — Distinguishes between global misconfigurations and risks that apply only to specific users, addresses, or groups.
 - **Duplicate Directive Detection** — Warns when a directive appears more than once globally, since sshd silently uses only the first occurrence.
@@ -37,26 +37,41 @@ AI was used for code generation, logic refinement, and edge-case handling (such 
 ## 📦 Requirements
 
 - Python **3.9+**
-- No external packages
+- No external packages — only the standard library
 
 ---
 
 ## ⚙️ Installation
 
-Since there are no external dependencies, you can run it directly:
+### Via pip (recommended)
 
 ```bash
-wget https://raw.githubusercontent.com/capitan0n/sshd-lint/main/sshd_lint.py -O sshd_lint
-chmod +x sshd_lint
-./sshd_lint
+pip install sshd-lint
 ```
 
-Or clone the repository:
+This installs the `sshd-lint` command on your `PATH`, so you can run it from anywhere:
+
+```bash
+sshd-lint /etc/ssh/sshd_config
+```
+
+### From source (for development)
+
+Clone the repository and install it in editable mode:
 
 ```bash
 git clone https://github.com/capitan0n/sshd-lint.git
 cd sshd-lint
-python sshd_lint.py
+pip install -e .
+sshd-lint /etc/ssh/sshd_config
+```
+
+Or run it as a module without installing, straight from the source tree:
+
+```bash
+git clone https://github.com/capitan0n/sshd-lint.git
+cd sshd-lint/src
+python -m sshd_lint /etc/ssh/sshd_config
 ```
 
 ---
@@ -64,7 +79,7 @@ python sshd_lint.py
 ## 📋 Sample Output
 
 ```
-$ sshd_lint /etc/ssh/sshd_config --severity medium --compact
+$ sshd-lint /etc/ssh/sshd_config --severity medium --compact
 
 sshd_lint 1.4.0 — /etc/ssh/sshd_config
 ────────────────────────────────────────────────────────────
@@ -103,31 +118,31 @@ disabled when piping or redirecting.
 Analyze the default system SSH config:
 
 ```bash
-python sshd_lint.py
+sshd-lint
 ```
 
 Analyze a specific file:
 
 ```bash
-python sshd_lint.py /path/to/sshd_config
+sshd-lint /path/to/sshd_config
 ```
 
 Filter by severity (only HIGH and above):
 
 ```bash
-python sshd_lint.py --severity high
+sshd-lint --severity high
 ```
 
 Compact output (hides explanations — useful for quick scans):
 
 ```bash
-python sshd_lint.py --compact
+sshd-lint --compact
 ```
 
 JSON output for pipeline integration:
 
 ```bash
-python sshd_lint.py --format json
+sshd-lint --format json
 ```
 
 The JSON output is self-contained — `exit_code` and a per-severity `summary` are included at the top level so consumers don't need to capture `$?` separately:
@@ -165,20 +180,20 @@ Filter with `jq`:
 
 ```bash
 # Only CRITICAL findings
-python sshd_lint.py --format json | jq '.findings[] | select(.severity == "CRITICAL")'
+sshd-lint --format json | jq '.findings[] | select(.severity == "CRITICAL")'
 
 # Summary only
-python sshd_lint.py --format json | jq '.summary'
+sshd-lint --format json | jq '.summary'
 
 # Read exit code from JSON instead of $?
-python sshd_lint.py --format json | jq '.exit_code'
+sshd-lint --format json | jq '.exit_code'
 ```
 
 Audit a config copied from a remote server, resolving Includes from the live system:
 
 ```bash
 scp user@server:/etc/ssh/sshd_config /tmp/audit/sshd_config
-python sshd_lint.py /tmp/audit/sshd_config --base-dir /etc/ssh
+sshd-lint /tmp/audit/sshd_config --base-dir /etc/ssh
 ```
 
 ---
@@ -228,10 +243,13 @@ CI systems treat **any** non-zero exit code as failure, which would collapse the
 distinction between `1` and `2`. Translate the verdict explicitly:
 
 ```yaml
+- name: Install sshd-lint
+  run: pip install sshd-lint
+
 - name: Lint SSH config
   run: |
     code=0
-    python sshd_lint.py /etc/ssh/sshd_config --format json > report.json || code=$?
+    sshd-lint /etc/ssh/sshd_config --format json > report.json || code=$?
     cat report.json
     # Fail only on HIGH/CRITICAL. Exit 1 = minor findings, informational.
     if [ "$code" -ge 2 ]; then
