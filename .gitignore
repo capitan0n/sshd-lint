@@ -3,3 +3,11 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# Python packaging
+/dist/
+/build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
