@@ -1,6 +1,7 @@
 # sshd_lint
 
-A zero-dependency, fast, and robust static analyzer for OpenSSH `sshd_config` files.
+A zero-dependency static analyzer for OpenSSH `sshd_config` files. Audits configs
+offline — no root, no network, no live server needed.
 
 `sshd_lint` evaluates your SSH server configuration against industry-standard security baselines, including the **CIS Benchmark for Linux**, **Mozilla OpenSSH Guidelines**, and **NIST SP 800-53**.
 
@@ -8,10 +9,9 @@ A zero-dependency, fast, and robust static analyzer for OpenSSH `sshd_config` fi
 
 ## 💡 Motivation
 
+This project was born out of a recurring practical need: quickly auditing an SSH server configuration whenever setting up a new test VM or reviewing a production host.
 
-This project was born out of a recurring practical need: quickly auditing the SSH configuration and status whenever setting up a new test VM or managing a production server.
-
-To solve this efficiently, I built this lightweight program to deliver instant results. It is completely self-contained, requires no internet connection to run, and has absolutely zero dependencies.
+Existing tools either require root on the live system or an open network connection to the server. `sshd_lint` takes the opposite approach — it reads the config file and nothing else, which means it works on a copy pulled from a machine you cannot log into, inside a container image, or in a CI pipeline where no SSH server is running at all.
 
 ---
 
@@ -29,7 +29,7 @@ AI was used for code generation, logic refinement, and edge-case handling (such 
 - **Scoped Match Block Findings** — Distinguishes between global misconfigurations and risks that apply only to specific users, addresses, or groups.
 - **Duplicate Directive Detection** — Warns when a directive appears more than once globally, since sshd silently uses only the first occurrence.
 - **Detailed, Actionable Reports** — Explains what is wrong, why it matters, and references the relevant standard.
-- **CI/CD Ready** — Structured JSON output and meaningful exit codes for pipeline integration.
+- **CI/CD Ready** — Structured JSON output, and exit codes that separate a security verdict from an operational failure.
 - **Version-Aware Rules** — Adjusts expectations based on target OpenSSH version.
 
 ---
@@ -55,9 +55,46 @@ Or clone the repository:
 
 ```bash
 git clone https://github.com/capitan0n/sshd-lint.git
-cd YOUR_REPO
+cd sshd-lint
 python sshd_lint.py
 ```
+
+---
+
+## 📋 Sample Output
+
+```
+$ sshd_lint /etc/ssh/sshd_config --severity medium --compact
+
+sshd_lint 1.4.0 — /etc/ssh/sshd_config
+────────────────────────────────────────────────────────────
+Findings: 5  CRITICAL: 1  HIGH: 1  MEDIUM: 3
+────────────────────────────────────────────────────────────
+
+[CRITICAL] PermitRootLogin (line 2)
+  Current value : yes
+  Issue         : Root login over SSH is permitted.
+
+[HIGH] PasswordAuthentication (line 3)
+  Current value : yes
+  Issue         : Password authentication is enabled.
+
+[MEDIUM] MaxAuthTries (line 5)
+  Current value : 8
+  Issue         : MaxAuthTries is 8 — recommended ≤ 4.
+
+[MEDIUM] AllowUsers / AllowGroups
+  Current value : <not set>
+  Issue         : No user or group allowlist is defined.
+
+[MEDIUM] X11Forwarding (line 4)
+  Current value : yes
+  Issue         : X11 forwarding is enabled.
+```
+
+Without `--compact`, each finding also carries a **Why it matters** explanation and the
+standards it references. Colors are enabled automatically when writing to a terminal and
+disabled when piping or redirecting.
 
 ---
 
@@ -99,26 +136,30 @@ The JSON output is self-contained — `exit_code` and a per-severity `summary` a
 {
   "exit_code": 2,
   "summary": {
-    "CRITICAL": 0,
+    "CRITICAL": 1,
     "HIGH": 1,
-    "MEDIUM": 3,
-    "LOW": 4,
-    "INFO": 2
+    "MEDIUM": 0,
+    "LOW": 0,
+    "INFO": 0
   },
   "findings": [
     {
       "severity": "HIGH",
       "directive": "PasswordAuthentication",
       "value": "yes",
-      "line": 42,
+      "line": 3,
       "scope": "global",
       "message": "Password authentication is enabled.",
-      "detail": "...",
+      "detail": "Password authentication is vulnerable to brute-force and credential-stuffing attacks. Disable it and use public-key authentication exclusively: 'PasswordAuthentication no'.",
       "references": ["CIS Benchmark for Linux", "Mozilla OpenSSH Guidelines"]
     }
   ]
 }
 ```
+
+Note that `exit_code` in the JSON only ever carries the findings verdict (`0`, `1` or `2`).
+Operational failures — a bad flag or a missing config file — produce no JSON at all, so a
+document that parses is always a real report.
 
 Filter with `jq`:
 
@@ -153,28 +194,56 @@ python sshd_lint.py /tmp/audit/sshd_config --base-dir /etc/ssh
 | `--no-color`          | —     | Disable ANSI colors |
 | `--openssh-version`   | —     | Target OpenSSH version (e.g. `8.9`) for version-aware rule adjustments |
 | `--base-dir`          | —     | Base directory for `Include` resolution. Default: same directory as the config file |
-| `--version`           | `-v`  | Show version and exit |
+| `--help`              | `-h`  | Show usage and exit |
+| `--version`           | `-V`  | Show version and exit |
+
+> `-V` is used for `--version` so that `-v` stays free for a future verbosity flag,
+> following the common convention where `-v` means verbose.
 
 ---
 
 ## 🚦 Exit Codes
 
-Designed for use in CI/CD pipelines:
+Exit codes fall into two groups. `0`–`2` are the **security verdict**; `64` and `66`
+signal that the tool could not run at all. Keeping them separate means a typo in a flag
+can never be mistaken by a pipeline for a critical finding.
 
 | Code | Meaning |
 |------|---------|
 | `0`  | No findings at or above the requested severity threshold |
 | `1`  | Findings exist, but none are HIGH or CRITICAL |
 | `2`  | At least one HIGH or CRITICAL finding — pipeline should fail |
+| `64` | Usage error — unrecognized flag or invalid argument (`EX_USAGE`) |
+| `66` | Config file not found or unreadable (`EX_NOINPUT`) |
 
-When using `--format json`, the exit code is also embedded in the JSON output as `exit_code`, so the report is fully self-contained and readable by downstream tools without capturing `$?`.
+`64` and `66` follow the conventional values from BSD `sysexits.h`.
 
-Example GitHub Actions step:
+When using `--format json`, the verdict is also embedded in the JSON output as
+`exit_code`, so the report is fully self-contained and readable by downstream tools
+without capturing `$?`.
+
+### GitHub Actions
+
+CI systems treat **any** non-zero exit code as failure, which would collapse the
+distinction between `1` and `2`. Translate the verdict explicitly:
 
 ```yaml
 - name: Lint SSH config
-  run: python sshd_lint.py /etc/ssh/sshd_config --severity high --format json
+  run: |
+    code=0
+    python sshd_lint.py /etc/ssh/sshd_config --format json > report.json || code=$?
+    cat report.json
+    # Fail only on HIGH/CRITICAL. Exit 1 = minor findings, informational.
+    if [ "$code" -ge 2 ]; then
+      echo "::error::HIGH or CRITICAL findings in sshd_config"
+      exit 1
+    fi
 ```
+
+`|| code=$?` does two jobs: it captures the exit code, and it stops `bash -e` (the default
+shell for `run:` steps) from aborting the script the moment the linter returns non-zero.
+`cat` must come *after* the capture, since `$?` only holds the status of the most recent
+command.
 
 ---
 
@@ -272,4 +341,3 @@ whether it fully replaces the list or is merely appended to it.
 ## 📜 License
 
 MIT License
-

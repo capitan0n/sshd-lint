@@ -1,15 +1,11 @@
-
-
+#!/usr/bin/env python3
 # ==============================================================================
-# Title:        ssh-lint
-# Description:  A lightweight, zero-dependency tool to instantly check SSH status.
+# Title:        sshd_lint
+# Description:  Zero-dependency static analyzer for OpenSSH sshd_config files.
+#               Audits configs offline against CIS, Mozilla and NIST baselines.
 # Author:       capitan0n
 # Date:         July 2026
 # ==============================================================================
-
-
-
-#!/usr/bin/env python3
 """
 sshd_lint.py — Static analyzer for sshd_config files.
 
@@ -37,7 +33,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
+
+# Raw string: the art contains backslashes that must not be read as escapes.
+# Kept at 51 columns so it never wraps on an 80-column terminal.
+BANNER = r"""
+             _          _         _  _         _
+ ___   ___  | |__    __| |       | |(_) _ __  | |_
+/ __| / __| | '_ \  / _` |       | || || '_ \ | __|
+\__ \ \__ \ | | | || (_| |       | || || | | || |_
+|___/ |___/ |_| |_| \__,_| _____ |_||_||_| |_| \__|
+"""
 
 if sys.version_info < (3, 9):
     sys.exit("Error: sshd_lint requires Python 3.9 or newer.")
@@ -1355,16 +1361,52 @@ def report_json(findings: list[Finding], exit_code: int) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
+# Exit codes.
+#   0/1/2 carry the findings verdict and are part of the public contract.
+#   64/66 follow sysexits.h and cover operational failures, so a typo in a
+#   flag or a missing file can never be mistaken by CI for a security verdict.
+EXIT_OK       = 0
+EXIT_FINDINGS = 1
+EXIT_CRITICAL = 2
+EXIT_USAGE    = 64   # EX_USAGE   — malformed command line
+EXIT_NOINPUT  = 66   # EX_NOINPUT — config file missing or unreadable
+
+
+class LintParser(argparse.ArgumentParser):
+    """ArgumentParser with GNU-style minimal error output.
+
+    argparse's default error() dumps the full usage block before the
+    message, which for this tool is five wrapped lines of flags. coreutils
+    instead prints one line and points at --help; that is both shorter and
+    the more familiar convention. Overriding error() also lets us exit with
+    EXIT_USAGE instead of argparse's hardcoded 2, which would otherwise
+    collide with "CRITICAL findings found".
+    """
+
+    def error(self, message: str):
+        self.exit(
+            EXIT_USAGE,
+            f"{self.prog}: error: {message}\n"
+            f"Try '{self.prog} --help' for more information.\n",
+        )
+
+
 def parse_args():
-    p = argparse.ArgumentParser(
+    p = LintParser(
         description="Static linter / security analyzer for sshd_config files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument(
-        "--version", "-v",
+        # -V, not -v: by convention -v means verbose, and reserving it now
+        # keeps that option open for a future verbosity flag.
+        "--version", "-V",
         action="version",
-        version=f"sshd_lint {__version__}",
+        # Multi-line version text survives intact only because the parser
+        # uses RawDescriptionHelpFormatter, whose _fill_text() skips the
+        # usual text wrapping that would otherwise mangle the art.
+        version=f"{BANNER}\nsshd_lint {__version__}\n"
+                f"MIT License — https://github.com/capitan0n/sshd-lint",
     )
     p.add_argument(
         "config",
@@ -1424,7 +1466,7 @@ def main():
     config_path = args.config.expanduser().resolve()
     if not config_path.exists():
         print(f"Error: file not found: {config_path}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_NOINPUT)
 
     # Resolve base_dir: explicit flag > directory of the config file.
     # Using the config file's own directory as default means Include paths
@@ -1456,11 +1498,11 @@ def main():
     #   1  — findings exist, but none are HIGH or CRITICAL
     #   2  — at least one HIGH or CRITICAL finding (pipeline should fail)
     if any(f.severity in (Severity.CRITICAL, Severity.HIGH) for f in findings):
-        exit_code = 2
+        exit_code = EXIT_CRITICAL
     elif findings:
-        exit_code = 1
+        exit_code = EXIT_FINDINGS
     else:
-        exit_code = 0
+        exit_code = EXIT_OK
 
     use_color = not args.no_color and sys.stdout.isatty()
 
