@@ -1,4 +1,4 @@
-# sshd_lint
+# sshd-lint
 
 A zero-dependency static analyzer for OpenSSH `sshd_config` files. It audits a
 configuration offline — no root, no network, and no running SSH server required.
