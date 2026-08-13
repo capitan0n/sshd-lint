@@ -29,6 +29,7 @@ References used in rules:
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -36,7 +37,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 # Raw string: the art contains backslashes that must not be read as escapes.
 # Kept at 51 columns so it never wraps on an 80-column terminal.
@@ -86,6 +87,11 @@ CUMULATIVE_DIRECTIVES = {
     "acceptenv",
     # Multiple HostKey paths load different key types (ed25519, rsa, ecdsa…)
     "hostkey",
+    # One HostCertificate per HostKey -- servconf.c appends unconditionally
+    "hostcertificate",
+    # Include may legitimately appear many times; the parser expands it and
+    # never stores it as a directive, but listing it here documents intent.
+    "include",
     # Multiple ListenAddress lines bind to multiple addresses/ports
     "listenaddress",
     # Multiple Port lines listen on multiple ports simultaneously
@@ -120,6 +126,10 @@ class Finding:
     detail:      str
     references:  list[str] = field(default_factory=list)
     line:        Optional[int] = None
+    # File the finding originates from. With Include expansion a bare line
+    # number is ambiguous, so every finding tied to a directive carries the
+    # file it was read from.
+    source:      Optional[Path] = None
     # None  → global scope
     # str   → the Match condition that scopes this finding (e.g. "User anoncvs")
     match_scope: Optional[str] = None
@@ -131,6 +141,9 @@ class ParsedDirective:
     key:             str
     value:           str
     line:            int
+    # The file this directive was read from -- not necessarily the top-level
+    # config, since Include pulls in additional files with their own numbering.
+    source:          Optional[Path] = None
     in_match:        bool = False
     match_condition: str  = ""
 
@@ -149,9 +162,21 @@ class SshdConfigParser:
       - Match blocks (including 'Match All' which resets global context)
       - Include directives with glob expansion
       - Circular Include protection
+      - Match state threaded across Include boundaries (see below)
 
     Does NOT:
       - Evaluate Match block conditions (only records the condition string)
+
+    Note on Match + Include
+    -----------------------
+    The active Match context is parser-wide state, NOT per-file state.  This
+    mirrors OpenSSH: servconf.c passes a single shared `activep` pointer down
+    into included files, so an Include inside a Match block is processed under
+    that Match, and a Match opened inside an included file stays open after
+    control returns to the parent file.  That second half is a genuine
+    footgun -- it is why distributions place the `Include sshd_config.d/*.conf`
+    line at the very TOP of sshd_config -- and modelling it per-file here
+    would silently mis-scope findings.
     """
 
     DIRECTIVE_RE = re.compile(
@@ -176,13 +201,32 @@ class SshdConfigParser:
         # Lines that were not blank/comment/Match/Include and didn't match
         # DIRECTIVE_RE either -- see rule_00_unparsed_lines.
         self.unparsed_lines: list[tuple[Path, int, str]]  = []
+        # Include globs that matched a directory -- see rule_00_include_dirs.
+        self.include_dirs: list[tuple[str, Path, int]]    = []
         self._by_key: dict[str, list[ParsedDirective]]    = {}
+        # Active Match context. Parser-wide on purpose -- see the class
+        # docstring: OpenSSH shares this state across Include boundaries.
+        self._in_match        = False
+        self._match_condition = ""
 
     def parse(self) -> list[ParsedDirective]:
         self._parse_file(self.path)
         for d in self.directives:
             self._by_key.setdefault(d.key.lower(), []).append(d)
         return self.directives
+
+    @staticmethod
+    def _unquote(value: str) -> str:
+        """Strip surrounding double quotes from a fully-quoted value.
+
+        sshd accepts `Banner "/etc/issue.net"`.  Only a value quoted as a
+        whole is unwrapped; `AllowUsers "user one" two` is left alone, since
+        stripping there would corrupt the argument list.
+        """
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"' \
+                and value.count('"') == 2:
+            return value[1:-1]
+        return value
 
     def _parse_file(self, path: Path):
         if path in self._visited:
@@ -194,9 +238,6 @@ class SshdConfigParser:
         except OSError as exc:
             self.parse_errors.append((path, str(exc)))
             return
-
-        in_match        = False
-        match_condition = ""
 
         for lineno, raw in enumerate(lines, start=1):
             line = raw.strip()
@@ -211,11 +252,11 @@ class SshdConfigParser:
                 # 'Match All' is a special keyword that ends any Match block
                 # and returns to global context (man sshd_config §Match)
                 if condition.lower() == "all":
-                    in_match        = False
-                    match_condition = ""
+                    self._in_match        = False
+                    self._match_condition = ""
                 else:
-                    in_match        = True
-                    match_condition = condition
+                    self._in_match        = True
+                    self._match_condition = condition
                 continue
 
             # ---- Include directive ------------------------------------------
@@ -224,12 +265,31 @@ class SshdConfigParser:
                 # single Include line -- each is its own glob(7) pattern.
                 include_args = line.split(None, 1)[1].strip()
                 for include_glob in include_args.split():
-                    if Path(include_glob).is_absolute():
-                        matched_paths = sorted(
-                            Path('/').glob(include_glob.lstrip('/'))
-                        )
-                    else:
-                        matched_paths = sorted(self.base_dir.glob(include_glob))
+                    include_glob = self._unquote(include_glob)
+                    try:
+                        if Path(include_glob).is_absolute():
+                            matched = sorted(
+                                Path('/').glob(include_glob.lstrip('/'))
+                            )
+                        else:
+                            matched = sorted(self.base_dir.glob(include_glob))
+                    except (ValueError, OSError) as exc:
+                        # A malformed pattern (e.g. containing '..') makes
+                        # pathlib raise rather than return an empty list.
+                        self.parse_errors.append((
+                            Path(include_glob),
+                            f"invalid Include pattern: {exc}",
+                        ))
+                        continue
+
+                    # A glob such as 'sshd_config.d/*' routinely matches
+                    # subdirectories.  Those are not config files; record
+                    # them separately instead of letting the open() fail and
+                    # surface as a CRITICAL "unreadable file".
+                    matched_paths = [p for p in matched if p.is_file()]
+                    for p in matched:
+                        if p.is_dir():
+                            self.include_dirs.append((include_glob, p, lineno))
 
                     if len(matched_paths) > self.MAX_INCLUDE_MATCHES:
                         self.parse_errors.append((
@@ -253,10 +313,11 @@ class SshdConfigParser:
             if m:
                 self.directives.append(ParsedDirective(
                     key=m.group('key'),
-                    value=m.group('value'),
+                    value=self._unquote(m.group('value')),
                     line=lineno,
-                    in_match=in_match,
-                    match_condition=match_condition,
+                    source=path,
+                    in_match=self._in_match,
+                    match_condition=self._match_condition,
                 ))
             else:
                 self.unparsed_lines.append((path, lineno, line))
@@ -350,9 +411,17 @@ OPENSSH_DEFAULTS: dict[str, str] = {
     "clientalivecountmax":             "3",
     "port":                            "22",
     # The four entries below document OpenSSH's compiled-in algorithm
-    # defaults for reference. Rules 40-44 only validate a directive that is
-    # explicitly set in the config; an absent directive is assumed to be
-    # using these (already secure) compiled-in defaults.
+    # defaults for reference only. Rules 40-44 evaluate a directive ONLY when
+    # it is explicitly set in the config.
+    #
+    # Be aware of what that means: the compiled-in "macs" list below still
+    # contains hmac-sha1 and umac-64@openssh.com, both of which appear in
+    # WEAK_MACS. A config that never mentions MACs is therefore reported
+    # clean by this tool while still negotiating SHA-1-based and 64-bit-tag
+    # MACs. That is a deliberate scope decision -- flagging the vendor
+    # default would fire on nearly every config in existence -- but it is a
+    # blind spot, not an endorsement. CIS and Mozilla both recommend setting
+    # an explicit algorithm list rather than relying on the defaults.
     "ciphers": (
         "chacha20-poly1305@openssh.com,"
         "aes128-ctr,aes192-ctr,aes256-ctr,"
@@ -411,6 +480,48 @@ WEAK_HOSTKEY = {"ssh-dss", "ssh-rsa"}
 COMMONLY_SCANNED_ALT_PORTS = {2222, 22222, 2022, 22022, 222, 2200}
 
 
+# sshd's convtime(3) time format: a run of <number><unit> pairs, where a
+# bare number means seconds. "600", "10m" and "5m600s" are all valid and all
+# accepted by sshd for LoginGraceTime / ClientAliveInterval.
+_TIME_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+_TIME_TOKEN_RE = re.compile(r'(\d+)([smhdwSMHDW]?)')
+
+
+def _parse_time(value: str) -> Optional[int]:
+    """Parse an sshd time specification into seconds, or None if malformed.
+
+    Returning None rather than raising lets callers distinguish "not a time"
+    from "zero seconds" -- a distinction that matters, because 0 is a
+    meaningful (and dangerous) value for LoginGraceTime.
+    """
+    v = value.strip()
+    if not v:
+        return None
+    total = 0
+    pos   = 0
+    for m in _TIME_TOKEN_RE.finditer(v):
+        if m.start() != pos:      # unexpected characters between tokens
+            return None
+        unit = m.group(2).lower()
+        total += int(m.group(1)) * _TIME_UNITS[unit]
+        pos = m.end()
+    if pos != len(v):             # trailing junk
+        return None
+    return total
+
+
+def _version_tuple(value: str) -> Optional[tuple[int, int]]:
+    """Parse an OpenSSH version like '8.9' or '9.6p1' into (major, minor).
+
+    Deliberately NOT float(): float('8.10') < float('8.9') is True, which
+    would silently invert every version comparison from OpenSSH 8.10 onward.
+    """
+    m = re.match(r'^\s*(\d+)(?:\.(\d+))?', value)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2) or 0))
+
+
 def _parse_algorithm_directive(value: str) -> tuple[str, set[str]]:
     """Split a Ciphers/MACs/KexAlgorithms/HostKeyAlgorithms/
     PubkeyAcceptedAlgorithms value into (mode, algorithms).
@@ -465,18 +576,29 @@ class RuleEngine:
         """Adjust baseline defaults for the target OpenSSH version."""
         if not self.openssh_version:
             return
-        try:
-            m = re.match(r'^(\d+)\.(\d+)', self.openssh_version)
-            if m:
-                version = float(f"{m.group(1)}.{m.group(2)}")
-                # Before 7.0, PermitRootLogin defaulted to 'yes'
-                if version < 7.0:
-                    self.defaults["permitrootlogin"] = "yes"
-        except ValueError:
-            pass
+        version = _version_tuple(self.openssh_version)
+        if version is None:
+            return
+        # Before 7.0, PermitRootLogin defaulted to 'yes'
+        if version < (7, 0):
+            self.defaults["permitrootlogin"] = "yes"
 
     def _get_directive(self, key: str) -> Optional[ParsedDirective]:
         return self.parser.get_global(key)
+
+    def _get_directive_any(self, *keys: str) -> tuple[str, Optional[ParsedDirective]]:
+        """Return (matched_key, directive) for the first key that is set.
+
+        Several sshd options were renamed across releases and both spellings
+        remain accepted. Checking only the modern name silently misses a
+        config written for an older server, so rules that care look up every
+        alias and report under whichever one the operator actually used.
+        """
+        for k in keys:
+            d = self._get_directive(k)
+            if d is not None:
+                return k, d
+        return keys[0], None
 
     def _effective_value(self, key: str) -> str:
         """Return the configured value, or the OpenSSH compiled-in default."""
@@ -485,12 +607,15 @@ class RuleEngine:
             return d.value
         return self.defaults.get(key.lower(), "<unknown>")
 
-    def _line(self, key: str) -> Optional[int]:
-        d = self._get_directive(key)
-        return d.line if d else None
-
     def _add(self, severity, directive, value, message, detail, refs,
-             match_scope=None):
+             match_scope=None, at=None):
+        """Record a finding.
+
+        `at` is the ParsedDirective the finding is about; it supplies both the
+        line number and the source file. When omitted it is looked up from the
+        directive name, which keeps the common one-directive rule terse.
+        """
+        d = at if at is not None else self._get_directive(directive)
         self.findings.append(Finding(
             severity=severity,
             directive=directive,
@@ -498,9 +623,65 @@ class RuleEngine:
             message=message,
             detail=detail,
             references=refs,
-            line=self._line(directive),
+            line=d.line if d else None,
+            source=d.source if d else None,
             match_scope=match_scope,
         ))
+
+    def _unparseable(self, directive: str, d: ParsedDirective, expected: str):
+        """Report a directive whose value the tool could not interpret.
+
+        Rules used to `return` silently here. For a security linter that is
+        the worst possible failure mode: the operator sees a clean report and
+        concludes the setting was checked, when in fact it was skipped.
+        """
+        self._add(
+            Severity.LOW,
+            directive, d.value,
+            f"Could not interpret the value of {directive} — it was NOT checked.",
+            (
+                f"Expected {expected}. Either the value is malformed (in which "
+                f"case sshd will refuse to start — verify with 'sshd -t'), or "
+                f"it uses a syntax this linter does not yet understand. Every "
+                f"rule for {directive} was skipped for this config."
+            ),
+            [self.MAN_REF],
+            at=d,
+        )
+
+    def _int_value(self, key: str) -> Optional[int]:
+        """Effective integer value of a directive, or None if uninterpretable.
+
+        An explicitly-set value that will not parse produces a LOW finding.
+        A missing directive falls back to the compiled-in default, which
+        always parses, so no finding is raised for that case.
+        """
+        d   = self._get_directive(key)
+        raw = d.value if d else self.defaults.get(key.lower())
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            if d is not None:
+                self._unparseable(key, d, "a plain integer")
+            return None
+
+    def _time_value(self, key: str) -> Optional[int]:
+        """Effective time value of a directive in seconds, or None.
+
+        Handles sshd's suffixed time format (30s, 10m, 1h). Previously these
+        rules did a bare int() and swallowed the ValueError, so a perfectly
+        valid 'LoginGraceTime 10m' was never evaluated at all.
+        """
+        d   = self._get_directive(key)
+        raw = d.value if d else self.defaults.get(key.lower())
+        if raw is None:
+            return None
+        seconds = _parse_time(raw)
+        if seconds is None and d is not None:
+            self._unparseable(key, d, "a time value such as 30, 30s, 10m or 1h")
+        return seconds
 
     def run(self) -> list[Finding]:
         self.findings = []
@@ -521,10 +702,12 @@ class RuleEngine:
         an offline audit walk a large filesystem tree).
         """
         for path, err in self.parser.parse_errors:
+            is_root = (path == self.parser.path)
             self._add(
                 Severity.CRITICAL,
-                "Include", str(path),
-                f"Include problem: {err}",
+                "(config file)" if is_root else "Include", str(path),
+                (f"Could not read the config file: {err}" if is_root
+                 else f"Include problem: {err}"),
                 (
                     "If sshd cannot read an included file, the directives it "
                     "contains are silently ignored -- this can cause critical "
@@ -534,6 +717,35 @@ class RuleEngine:
                 ),
                 ["File System / IO Error", self.MAN_REF],
             )
+
+    def rule_00_include_dirs(self):
+        """Flag Include globs that matched a directory.
+
+        A pattern like 'sshd_config.d/*' routinely picks up subdirectories.
+        Those are skipped rather than opened, because letting the open() fail
+        would surface as a CRITICAL 'unreadable file' -- a false alarm on a
+        very common layout.
+        """
+        for pattern, dir_path, lineno in self.parser.include_dirs:
+            self.findings.append(Finding(
+                severity=Severity.LOW,
+                directive="Include",
+                value=str(dir_path),
+                message=(
+                    f"Include pattern '{pattern}' matched a directory "
+                    f"({dir_path.name}); it was skipped."
+                ),
+                detail=(
+                    "sshd_lint does not descend into directories matched by an "
+                    "Include glob, and sshd will not read one as a config file "
+                    "either. If configuration is meant to live in there, widen "
+                    "the pattern (e.g. 'sshd_config.d/*.conf' plus an explicit "
+                    "entry for the subdirectory). Verify with 'sshd -t'."
+                ),
+                references=[self.MAN_REF],
+                line=lineno,
+                source=self.parser.path,
+            ))
 
     def rule_00_empty_includes(self):
         """Flag Include patterns that matched zero files.
@@ -557,6 +769,7 @@ class RuleEngine:
                 ),
                 references=[self.MAN_REF],
                 line=lineno,
+                source=self.parser.path,
             ))
 
     def rule_00_unparsed_lines(self):
@@ -580,6 +793,7 @@ class RuleEngine:
                 ),
                 references=[self.MAN_REF],
                 line=lineno,
+                source=path,
             ))
 
     # ------------------------------------------------------------------
@@ -644,11 +858,20 @@ class RuleEngine:
             )
 
     def rule_04_challenge_response(self):
-        val = self._effective_value("ChallengeResponseAuthentication").lower()
+        # OpenSSH 8.7 renamed ChallengeResponseAuthentication to
+        # KbdInteractiveAuthentication; both spellings still work and set the
+        # same option. Checking only the old name meant every config written
+        # against a modern server slipped past this rule entirely.
+        key, d = self._get_directive_any(
+            "ChallengeResponseAuthentication",
+            "KbdInteractiveAuthentication",
+        )
+        val = (d.value if d else
+               self.defaults["challengeresponseauthentication"]).lower()
         if val == "yes":
             self._add(
                 Severity.MEDIUM,
-                "ChallengeResponseAuthentication", val,
+                key, val,
                 "Challenge-response authentication is enabled.",
                 (
                     "Unless you specifically need TOTP or PAM challenge-response, "
@@ -657,6 +880,7 @@ class RuleEngine:
                     "is 'no'."
                 ),
                 [self.CIS_REF, self.MAN_REF],
+                at=d,
             )
 
     def rule_05_pubkey_authentication(self):
@@ -712,12 +936,29 @@ class RuleEngine:
     # ------------------------------------------------------------------
 
     def rule_10_login_grace_time(self):
-        raw = self._effective_value("LoginGraceTime")
-        try:
-            seconds = int(raw)
-        except ValueError:
+        raw     = self._effective_value("LoginGraceTime")
+        seconds = self._time_value("LoginGraceTime")
+        if seconds is None:
             return
-        if seconds > 60:
+
+        if seconds == 0:
+            # sshd_config(5): "If the value is 0, there is no time limit."
+            # This is strictly worse than any large positive value, yet the
+            # previous '> 60' test let it through without a word.
+            self._add(
+                Severity.MEDIUM,
+                "LoginGraceTime", raw,
+                "LoginGraceTime is 0 — unauthenticated connections never time out.",
+                (
+                    "A value of 0 disables the grace timeout entirely, so a "
+                    "connection that never authenticates is held open forever. "
+                    "Combined with MaxStartups this makes it trivial to exhaust "
+                    "every unauthenticated connection slot and lock legitimate "
+                    "users out of the server. Set 30 or 60 seconds."
+                ),
+                [self.CIS_REF, self.MAN_REF],
+            )
+        elif seconds > 60:
             self._add(
                 Severity.LOW,
                 "LoginGraceTime", raw,
@@ -732,9 +973,8 @@ class RuleEngine:
 
     def rule_11_max_auth_tries(self):
         raw = self._effective_value("MaxAuthTries")
-        try:
-            n = int(raw)
-        except ValueError:
+        n   = self._int_value("MaxAuthTries")
+        if n is None:
             return
         if n > 4:
             self._add(
@@ -751,9 +991,8 @@ class RuleEngine:
 
     def rule_12_max_sessions(self):
         raw = self._effective_value("MaxSessions")
-        try:
-            n = int(raw)
-        except ValueError:
+        n   = self._int_value("MaxSessions")
+        if n is None:
             return
         if n > 10:
             self._add(
@@ -771,9 +1010,22 @@ class RuleEngine:
     def rule_13_max_startups(self):
         raw   = self._effective_value("MaxStartups")
         parts = raw.split(':')
+        d     = self._get_directive("MaxStartups")
+        # sshd_config(5) accepts either 'number' or 'start:rate:full'.
+        # Anything else is malformed and sshd will reject it at startup.
+        if len(parts) not in (1, 3):
+            if d is not None:
+                self._unparseable(
+                    "MaxStartups", d, "either 'number' or 'start:rate:full'"
+                )
+            return
         try:
             full = int(parts[-1])
-        except (ValueError, IndexError):
+        except ValueError:
+            if d is not None:
+                self._unparseable(
+                    "MaxStartups", d, "either 'number' or 'start:rate:full'"
+                )
             return
         if full > 100:
             self._add(
@@ -1013,9 +1265,13 @@ class RuleEngine:
             )
 
     def rule_44_weak_pubkey_accepted_algorithms(self):
-        # Called PubkeyAcceptedKeyTypes before OpenSSH 8.5; only the
-        # current name is checked here.
-        d = self._get_directive("PubkeyAcceptedAlgorithms")
+        # Called PubkeyAcceptedKeyTypes before OpenSSH 8.5. Both spellings are
+        # still accepted, and configs on long-lived servers commonly use the
+        # old one -- checking only the modern name missed them silently.
+        key, d = self._get_directive_any(
+            "PubkeyAcceptedAlgorithms",
+            "PubkeyAcceptedKeyTypes",
+        )
         if d is None:
             return
         mode, configured = _parse_algorithm_directive(d.value)
@@ -1025,7 +1281,7 @@ class RuleEngine:
         if found_weak:
             self._add(
                 Severity.HIGH,
-                "PubkeyAcceptedAlgorithms", d.value,
+                key, d.value,
                 f"Deprecated public-key signature algorithm(s): {', '.join(sorted(found_weak))}.",
                 (
                     "Governs which client key algorithms sshd accepts for "
@@ -1034,6 +1290,7 @@ class RuleEngine:
                     "DSA) is broken. Use ssh-ed25519 or rsa-sha2-512/256."
                 ),
                 [self.MOZ_REF, "OpenSSH Release Notes (8.8)"],
+                at=d,
             )
 
     # ------------------------------------------------------------------
@@ -1073,10 +1330,23 @@ class RuleEngine:
             )
 
     def rule_52_port(self):
-        raw = self._effective_value("Port")
+        # Port is cumulative: sshd listens on EVERY Port line, so the
+        # first-wins helper is the wrong tool here. 'Port 2222' followed by
+        # 'Port 22' used to report only the 2222 line while sshd happily
+        # served 22 as well.
+        ports = self.parser.get_global_all("Port")
+        if not ports:
+            self._check_port(self.defaults["port"], None)
+            return
+        for d in ports:
+            self._check_port(d.value, d)
+
+    def _check_port(self, raw: str, d: Optional[ParsedDirective]):
         try:
             port = int(raw)
         except ValueError:
+            if d is not None:
+                self._unparseable("Port", d, "a TCP port number")
             return
 
         if port == 22:
@@ -1094,6 +1364,7 @@ class RuleEngine:
                     "high-numbered port instead."
                 ),
                 ["Security best practice (low priority)"],
+                at=d,
             )
         elif port in COMMONLY_SCANNED_ALT_PORTS:
             self._add(
@@ -1111,14 +1382,15 @@ class RuleEngine:
                     "authentication."
                 ),
                 ["Security best practice (informational)"],
+                at=d,
             )
 
     def rule_53_client_alive(self):
         interval = self._effective_value("ClientAliveInterval")
-        try:
-            i = int(interval)
-        except ValueError:
+        i        = self._time_value("ClientAliveInterval")
+        if i is None:
             return
+
         if i == 0:
             self._add(
                 Severity.LOW,
@@ -1131,6 +1403,27 @@ class RuleEngine:
                     "and 'ClientAliveCountMax 2' to disconnect after ~10 min."
                 ),
                 [self.CIS_REF],
+            )
+            return
+
+        # An interval alone is not enough. sshd_config(5): "Setting a zero
+        # ClientAliveCountMax disables connection termination." A config with
+        # 'ClientAliveInterval 300' and 'ClientAliveCountMax 0' looks hardened
+        # at a glance but never actually drops an idle session.
+        count_max = self._int_value("ClientAliveCountMax")
+        if count_max == 0:
+            self._add(
+                Severity.LOW,
+                "ClientAliveCountMax", self._effective_value("ClientAliveCountMax"),
+                "ClientAliveCountMax is 0 — the idle timeout never fires.",
+                (
+                    f"ClientAliveInterval is set to {interval}, but a zero "
+                    f"ClientAliveCountMax disables connection termination "
+                    f"entirely: sshd keeps probing and never disconnects. The "
+                    f"session timeout this pair appears to configure does not "
+                    f"exist. Set ClientAliveCountMax to 2 or 3."
+                ),
+                [self.CIS_REF, self.MAN_REF],
             )
 
     def rule_54_use_dns(self):
@@ -1218,6 +1511,7 @@ class RuleEngine:
                         ),
                         references=[self.CIS_REF, self.MAN_REF],
                         line=d.line,
+                        source=d.source,
                         match_scope=d.match_condition,
                     ))
 
@@ -1234,6 +1528,14 @@ class RuleEngine:
         value active — a dangerous false sense of security.
         """
         for winner, shadowed in self.parser.get_shadowed_globals():
+            # The winner may live in a different file than the duplicate once
+            # Include is in play, so name the file whenever they differ --
+            # "the effective value is on line 3" is useless advice if line 3
+            # is in a snippet the operator is not currently looking at.
+            if winner.source != shadowed.source and winner.source is not None:
+                winner_loc = f"{winner.source} line {winner.line}"
+            else:
+                winner_loc = f"line {winner.line}"
             self.findings.append(Finding(
                 severity=Severity.MEDIUM,
                 directive=shadowed.key,
@@ -1245,7 +1547,7 @@ class RuleEngine:
                 detail=(
                     f"sshd uses the FIRST occurrence of each directive. "
                     f"The effective value is '{winner.value}' "
-                    f"from line {winner.line}. "
+                    f"from {winner_loc}. "
                     f"The duplicate on line {shadowed.line} "
                     f"('{shadowed.value}') is silently discarded. "
                     f"Remove the duplicate or the original to make the "
@@ -1253,6 +1555,7 @@ class RuleEngine:
                 ),
                 references=[self.MAN_REF],
                 line=shadowed.line,
+                source=shadowed.source,
                 match_scope=None,
             ))
 
@@ -1298,16 +1601,32 @@ def _colorize(text: str, severity: Severity, use_color: bool) -> str:
     return f"{SEVERITY_COLOR[severity]}{text}{RESET}"
 
 
+def _location(f: Finding, main_config: Optional[Path]) -> str:
+    """Render a finding's location.
+
+    A bare line number is only unambiguous while everything lives in one
+    file. As soon as Include is involved, "(line 3)" could point at any of a
+    dozen snippets, so findings from anywhere other than the main config are
+    qualified with their filename.
+    """
+    if not f.line:
+        return ""
+    if f.source is not None and f.source != main_config:
+        return f" ({f.source}:{f.line})"
+    return f" (line {f.line})"
+
+
 def report_text(findings: list[Finding],
-                use_color: bool = True,
-                compact:   bool = False) -> str:
+                use_color:   bool = True,
+                compact:     bool = False,
+                main_config: Optional[Path] = None) -> str:
     if not findings:
         return "✓ No issues found.\n"
 
     lines = []
     for f in findings:
         sev = _colorize(f"[{f.severity.value}]", f.severity, use_color)
-        loc = f" (line {f.line})" if f.line else ""
+        loc = _location(f, main_config)
         scope_tag = (
             _colorize(f" [Match: {f.match_scope}]", Severity.INFO, use_color)
             if f.match_scope else ""
@@ -1346,6 +1665,9 @@ def report_json(findings: list[Finding], exit_code: int) -> str:
                     "severity":   f.severity.value,
                     "directive":  f.directive,
                     "value":      f.value,
+                    # 'file' is additive as of 1.5.0: with Include expansion a
+                    # line number on its own does not identify a location.
+                    "file":       str(f.source) if f.source else None,
                     "line":       f.line,
                     "scope":      f.match_scope if f.match_scope else "global",
                     "message":    f.message,
@@ -1373,6 +1695,10 @@ EXIT_FINDINGS = 1
 EXIT_CRITICAL = 2
 EXIT_USAGE    = 64   # EX_USAGE   — malformed command line
 EXIT_NOINPUT  = 66   # EX_NOINPUT — config file missing or unreadable
+# Shell convention, 128 + signal number. Chosen over anything in the 0-2
+# range so an interrupted or truncated run can never be read as a verdict.
+EXIT_SIGINT   = 130  # 128 + SIGINT  — Ctrl-C
+EXIT_SIGPIPE  = 141  # 128 + SIGPIPE — output closed early, e.g. `| head`
 
 
 class LintParser(argparse.ArgumentParser):
@@ -1392,6 +1718,21 @@ class LintParser(argparse.ArgumentParser):
             f"{self.prog}: error: {message}\n"
             f"Try '{self.prog} --help' for more information.\n",
         )
+
+
+def _openssh_version_arg(value: str) -> str:
+    """Validate --openssh-version at the CLI boundary.
+
+    Previously an unparseable version was swallowed and the run continued
+    with unadjusted defaults, so '--openssh-version six' produced a report
+    that quietly did not mean what the operator asked for. A bad flag is a
+    usage error and belongs in the 64 bucket, not in the verdict.
+    """
+    if _version_tuple(value) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid OpenSSH version {value!r}: expected something like 8.9 or 9.6p1"
+        )
+    return value
 
 
 def parse_args():
@@ -1438,11 +1779,12 @@ def parse_args():
     p.add_argument(
         "--no-color",
         action="store_true",
-        help="Disable ANSI color output.",
+        help="Disable ANSI color output (the NO_COLOR env var also works).",
     )
     p.add_argument(
         "--openssh-version",
         metavar="VERSION",
+        type=_openssh_version_arg,
         default=None,
         help="OpenSSH version of the target (e.g. 8.9) for version-aware rules.",
     )
@@ -1463,12 +1805,30 @@ def severity_gte(sev: Severity, minimum: Severity) -> bool:
     return SEVERITY_ORDER.index(sev) <= SEVERITY_ORDER.index(minimum)
 
 
-def main():
+def _run():
     args = parse_args()
 
     config_path = args.config.expanduser().resolve()
+
+    # Validate the top-level config up front. Without this check an
+    # unreadable or non-regular file fell through to the parser, which
+    # recorded it as an Include failure and reported it as a CRITICAL
+    # finding -- exit 2. That is precisely the confusion the 64/66 split
+    # exists to prevent: "I cannot audit this" is not "this config is
+    # dangerous", and a CI gate must not treat them alike.
     if not config_path.exists():
         print(f"Error: file not found: {config_path}", file=sys.stderr)
+        sys.exit(EXIT_NOINPUT)
+    if not config_path.is_file():
+        print(f"Error: not a regular file: {config_path}", file=sys.stderr)
+        sys.exit(EXIT_NOINPUT)
+    try:
+        # Actually open it rather than consulting the permission bits:
+        # os.access() gets ACLs, capabilities and read-only mounts wrong.
+        with config_path.open("rb"):
+            pass
+    except OSError as exc:
+        print(f"Error: cannot read {config_path}: {exc}", file=sys.stderr)
         sys.exit(EXIT_NOINPUT)
 
     # Resolve base_dir: explicit flag > directory of the config file.
@@ -1507,7 +1867,13 @@ def main():
     else:
         exit_code = EXIT_OK
 
-    use_color = not args.no_color and sys.stdout.isatty()
+    # NO_COLOR (https://no-color.org): honoured when set to any non-empty
+    # value, regardless of content. Widely respected by modern CLI tools.
+    use_color = (
+        not args.no_color
+        and not os.environ.get("NO_COLOR")
+        and sys.stdout.isatty()
+    )
 
     if args.format == "text":
         by_sev = {s: sum(1 for f in findings if f.severity == s) for s in Severity}
@@ -1522,13 +1888,43 @@ def main():
             )
         )
         print(f"{'─' * 60}\n")
-        print(report_text(findings, use_color=use_color, compact=args.compact))
+        print(report_text(
+            findings,
+            use_color=use_color,
+            compact=args.compact,
+            main_config=config_path,
+        ))
     else:
         # Pass exit_code into the JSON report so it is self-contained:
         # consumers can read exit_code from the JSON instead of capturing $?.
         print(report_json(findings, exit_code))
 
     sys.exit(exit_code)
+
+
+def main():
+    """Entry point wrapper for signal-shaped terminations.
+
+    `sshd-lint | head` closes the pipe mid-write, and `sshd-lint` on a slow
+    filesystem invites a Ctrl-C. Both used to dump a traceback. Neither is an
+    error in the tool, so both get a shell-conventional 128+signal status
+    that stays clear of the 0/1/2 verdict range.
+    """
+    try:
+        _run()
+    except KeyboardInterrupt:
+        sys.exit(EXIT_SIGINT)
+    except BrokenPipeError:
+        # Python flushes stdout during interpreter shutdown; if it is still
+        # pointed at the dead pipe that flush raises a second BrokenPipeError
+        # and prints "Exception ignored in: ...". Redirecting the fd to
+        # /dev/null first makes the final flush a no-op.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(EXIT_SIGPIPE)
 
 
 if __name__ == "__main__":

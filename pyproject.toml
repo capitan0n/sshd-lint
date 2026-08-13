@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned: the PEP 639 metadata below (SPDX `license` string plus
+# `license-files`) is only understood by hatchling 1.27 and newer. An older
+# build backend fails on it, which would break anyone building from the sdist.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -20,14 +23,21 @@ classifiers = [
     "Topic :: Security",
     "Topic :: System :: Systems Administration",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: POSIX :: BSD",
 ]
 
 [project.urls]
 Homepage = "https://github.com/capitan0n/sshd-lint"
 Repository = "https://github.com/capitan0n/sshd-lint"
 Issues = "https://github.com/capitan0n/sshd-lint/issues"
+Changelog = "https://github.com/capitan0n/sshd-lint/releases"
 
 [project.scripts]
 sshd-lint = "sshd_lint:main"
