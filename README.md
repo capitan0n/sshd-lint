@@ -26,7 +26,10 @@ with enough parsing fidelity to model the parts of OpenSSH's semantics that actu
 - **Zero runtime dependencies.** Built entirely on the Python standard library. Installs
   with a single `pip install`, then runs with nothing else.
 - **Context-aware parsing.** Understands OpenSSH semantics: `Match` blocks, `Match All`
-  reset, directive shadowing, cumulative directives, and `Include` glob expansion.
+  reset, directive shadowing (including across renamed aliases such as
+  `ChallengeResponseAuthentication` / `KbdInteractiveAuthentication`), cumulative
+  directives, trailing `#` comments, and `Include` glob expansion with `glob(3)` rules
+  (hidden files are not matched by `*`).
 - **Match state threaded through includes.** An `Include` inside a `Match` block is analyzed
   under that block, and a `Match` opened inside an included file stays open after control
   returns — mirroring how sshd itself behaves.
@@ -97,7 +100,7 @@ python -m sshd_lint /etc/ssh/sshd_config
 ```
 $ sshd-lint samples/realistic.conf --severity medium --compact
 
-sshd_lint 1.5.0 — /path/to/samples/realistic.conf
+sshd_lint 1.5.1 — /path/to/samples/realistic.conf
 ────────────────────────────────────────────────────────────
 Findings: 5  HIGH: 1  MEDIUM: 4
 ────────────────────────────────────────────────────────────
@@ -430,6 +433,7 @@ lightweight regression suite. Each targets a different aspect of the analyzer.
 | `chaos.conf` | A deliberately catastrophic config that exercises every rule category | Many findings across all severities |
 | `tricky.conf` | Subtle mistakes a naive parser skips: time suffixes, aliased directives, cumulative directives, an idle-timeout trap, an uninterpretable value | Findings a simpler linter would miss |
 | `edge.conf` + `edge_config.d/` | Include expansion and Match-scope threading across files | Findings correctly scoped to the file and Match condition they come from |
+| `parsing.conf` + `parsing_config.d/` | Syntax corners: trailing `#` comments, a tab-separated `Include`, a hidden drop-in sshd never reads, renamed directives where the first spelling wins | CRITICAL for the commented `PermitRootLogin yes`; nothing from the hidden file |
 
 `hardened.conf` in particular acts as a contract: if a future change makes it produce a
 finding, either the config or the rule that fired needs a second look.
@@ -466,6 +470,7 @@ Run them with:
 ```bash
 sshd-lint samples/tricky.conf --compact
 sshd-lint samples/edge.conf --base-dir samples --compact
+sshd-lint samples/parsing.conf --base-dir samples --compact
 ```
 
 The `--base-dir samples` argument is required for `edge.conf` because its `Include` path is

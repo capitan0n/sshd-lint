@@ -1,0 +1,13 @@
+oracle    : JSON
+iteration : 1
+seed      : 0
+origin    : clean
+exit code : 1
+elapsed   : 0.024s
+
+empty stdout with exit 1
+
+--- stdout ---
+
+--- stderr ---
+/usr/bin/python3: No module named sshd_lint

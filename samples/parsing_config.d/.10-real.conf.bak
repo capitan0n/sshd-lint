@@ -1,0 +1,3 @@
+# Hidden leftover: glob(3) skips dotfiles, so sshd NEVER reads this.
+# sshd_lint must not report anything from it.
+PermitRootLogin yes

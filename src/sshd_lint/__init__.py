@@ -37,7 +37,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # Raw string: the art contains backslashes that must not be read as escapes.
 # Kept at 51 columns so it never wraps on an 80-column terminal.
@@ -111,6 +111,44 @@ CUMULATIVE_DIRECTIVES = {
     "denygroups",
 }
 
+# ---------------------------------------------------------------------------
+# Directive aliases
+#
+# Options renamed across OpenSSH releases. Both spellings set the SAME option
+# in servconf.c, so first-wins applies across them: whichever spelling comes
+# first in the file is the one sshd uses. Keys are folded to the modern name
+# for lookup and duplicate detection.
+# ---------------------------------------------------------------------------
+
+DIRECTIVE_ALIASES = {
+    "challengeresponseauthentication": "kbdinteractiveauthentication",
+    "pubkeyacceptedkeytypes":          "pubkeyacceptedalgorithms",
+    "hostbasedacceptedkeytypes":       "hostbasedacceptedalgorithms",
+}
+
+
+def _canonical_key(key: str) -> str:
+    k = key.lower()
+    return DIRECTIVE_ALIASES.get(k, k)
+
+
+def _strip_comment(line: str) -> str:
+    """Remove a trailing comment from a config line.
+
+    Since OpenSSH 8.7, sshd splits lines with argv_split(..., 1), which ends
+    the line at a '#' that starts a new word outside quotes. So
+    'PermitRootLogin yes # temp' means 'yes'. Keeping the comment in the
+    value made every value comparison fail and the directive pass silently.
+    A '#' inside a word (e.g. 'Banner /etc/is#sue') is not a comment.
+    """
+    in_quote = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == '#' and not in_quote and (i == 0 or line[i - 1].isspace()):
+            return line[:i].rstrip()
+    return line
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -182,7 +220,10 @@ class SshdConfigParser:
     DIRECTIVE_RE = re.compile(
         r'^(?P<key>[A-Za-z][A-Za-z0-9]+)\s*[=\s]\s*(?P<value>.+?)\s*$'
     )
-    MATCH_RE = re.compile(r'^Match\s+(.+)$', re.IGNORECASE)
+    # Keyword and argument may be separated by any whitespace (tabs
+    # included) or by '=', exactly like a regular directive.
+    MATCH_RE   = re.compile(r'^Match(?:\s+|\s*=\s*)(.+)$', re.IGNORECASE)
+    INCLUDE_RE = re.compile(r'^Include(?:\s+|\s*=\s*)(.+)$', re.IGNORECASE)
 
     # A single Include line matching more files than this is refused rather
     # than expanded. Guards against a typo'd glob (e.g. an absolute pattern
@@ -197,12 +238,12 @@ class SshdConfigParser:
         self._visited:   set[Path]                        = set()
         self.parse_errors: list[tuple[Path, str]]         = []
         # Include patterns that matched zero files -- see rule_00_empty_includes.
-        self.empty_includes: list[tuple[str, int]]        = []
+        self.empty_includes: list[tuple[str, Path, int]]  = []
         # Lines that were not blank/comment/Match/Include and didn't match
         # DIRECTIVE_RE either -- see rule_00_unparsed_lines.
         self.unparsed_lines: list[tuple[Path, int, str]]  = []
         # Include globs that matched a directory -- see rule_00_include_dirs.
-        self.include_dirs: list[tuple[str, Path, int]]    = []
+        self.include_dirs: list[tuple[str, Path, Path, int]] = []
         self._by_key: dict[str, list[ParsedDirective]]    = {}
         # Active Match context. Parser-wide on purpose -- see the class
         # docstring: OpenSSH shares this state across Include boundaries.
@@ -212,7 +253,7 @@ class SshdConfigParser:
     def parse(self) -> list[ParsedDirective]:
         self._parse_file(self.path)
         for d in self.directives:
-            self._by_key.setdefault(d.key.lower(), []).append(d)
+            self._by_key.setdefault(_canonical_key(d.key), []).append(d)
         return self.directives
 
     @staticmethod
@@ -240,9 +281,9 @@ class SshdConfigParser:
             return
 
         for lineno, raw in enumerate(lines, start=1):
-            line = raw.strip()
+            line = _strip_comment(raw.strip())
 
-            if not line or line.startswith('#'):
+            if not line:
                 continue
 
             # ---- Match block header ----------------------------------------
@@ -260,19 +301,21 @@ class SshdConfigParser:
                 continue
 
             # ---- Include directive ------------------------------------------
-            if line.lower().startswith('include '):
+            m = self.INCLUDE_RE.match(line)
+            if m:
                 # sshd_config(5): "Multiple pathnames may be specified" on a
                 # single Include line -- each is its own glob(7) pattern.
-                include_args = line.split(None, 1)[1].strip()
-                for include_glob in include_args.split():
+                for include_glob in m.group(1).split():
                     include_glob = self._unquote(include_glob)
                     try:
                         if Path(include_glob).is_absolute():
-                            matched = sorted(
-                                Path('/').glob(include_glob.lstrip('/'))
-                            )
+                            root, pattern = Path('/'), include_glob.lstrip('/')
                         else:
-                            matched = sorted(self.base_dir.glob(include_glob))
+                            root, pattern = self.base_dir, include_glob
+                        matched = sorted(
+                            p for p in root.glob(pattern)
+                            if not self._hidden_mismatch(p, root, pattern)
+                        )
                     except (ValueError, OSError) as exc:
                         # A malformed pattern (e.g. containing '..') makes
                         # pathlib raise rather than return an empty list.
@@ -289,7 +332,9 @@ class SshdConfigParser:
                     matched_paths = [p for p in matched if p.is_file()]
                     for p in matched:
                         if p.is_dir():
-                            self.include_dirs.append((include_glob, p, lineno))
+                            self.include_dirs.append(
+                                (include_glob, p, path, lineno)
+                            )
 
                     if len(matched_paths) > self.MAX_INCLUDE_MATCHES:
                         self.parse_errors.append((
@@ -300,7 +345,7 @@ class SshdConfigParser:
                         continue
 
                     if not matched_paths:
-                        self.empty_includes.append((include_glob, lineno))
+                        self.empty_includes.append((include_glob, path, lineno))
 
                     for inc_path in matched_paths:
                         # resolve() so the same physical file reached via two
@@ -322,6 +367,22 @@ class SshdConfigParser:
             else:
                 self.unparsed_lines.append((path, lineno, line))
 
+    @staticmethod
+    def _hidden_mismatch(p: Path, root: Path, pattern: str) -> bool:
+        """True if glob(3) -- which sshd uses -- would NOT match p.
+
+        glob(3) only matches a leading '.' in a path component when the
+        pattern component itself starts with '.'; pathlib's '*' matches
+        dotfiles too. Without this, a leftover '.old.conf' in
+        sshd_config.d/ was parsed even though sshd never reads it.
+        """
+        pat_parts = Path(pattern).parts
+        for i, part in enumerate(p.relative_to(root).parts):
+            if part.startswith('.'):
+                if i >= len(pat_parts) or not pat_parts[i].startswith('.'):
+                    return True
+        return False
+
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
@@ -333,18 +394,19 @@ class SshdConfigParser:
         times in global scope, the first occurrence wins (except for
         CUMULATIVE_DIRECTIVES, which callers handle separately).
         """
-        for d in self._by_key.get(key.lower(), ()):
+        for d in self._by_key.get(_canonical_key(key), ()):
             if not d.in_match:
                 return d
         return None
 
     def get_global_all(self, key: str) -> list[ParsedDirective]:
         """Return ALL global occurrences of a directive (for duplicate detection)."""
-        return [d for d in self._by_key.get(key.lower(), ()) if not d.in_match]
+        return [d for d in self._by_key.get(_canonical_key(key), ())
+                if not d.in_match]
 
     def get_all(self, key: str) -> list[ParsedDirective]:
         """Return all directives (global + Match) with the given key."""
-        return list(self._by_key.get(key.lower(), ()))
+        return list(self._by_key.get(_canonical_key(key), ()))
 
     def get_shadowed_globals(self) -> list[tuple[ParsedDirective, ParsedDirective]]:
         """Return (winner, shadowed) pairs for duplicate global directives.
@@ -362,7 +424,7 @@ class SshdConfigParser:
         for d in self.directives:
             if d.in_match:
                 continue
-            k = d.key.lower()
+            k = _canonical_key(d.key)
             if k in CUMULATIVE_DIRECTIVES:
                 continue
             if k in seen:
@@ -384,7 +446,10 @@ OPENSSH_DEFAULTS: dict[str, str] = {
     "permitrootlogin":                 "prohibit-password",
     "passwordauthentication":          "yes",
     "permitemptypasswords":            "no",
-    "challengeresponseauthentication": "no",
+    # Upstream default is 'yes' (the 8.7 rename to KbdInteractive kept it).
+    # Debian/Ubuntu ship 'no' in their sshd_config, which is why an explicit
+    # line is what usually decides this; stored under the canonical name.
+    "kbdinteractiveauthentication":    "yes",
     "pubkeyauthentication":            "yes",
     "hostbasedauthentication":         "no",
     "ignorerhosts":                    "yes",
@@ -594,10 +659,13 @@ class RuleEngine:
         config written for an older server, so rules that care look up every
         alias and report under whichever one the operator actually used.
         """
+        # The parser folds aliases together, so this returns whichever
+        # spelling appears FIRST in the file -- the one sshd actually uses --
+        # rather than whichever name happens to be listed first here.
         for k in keys:
             d = self._get_directive(k)
             if d is not None:
-                return k, d
+                return d.key, d
         return keys[0], None
 
     def _effective_value(self, key: str) -> str:
@@ -605,7 +673,7 @@ class RuleEngine:
         d = self._get_directive(key)
         if d:
             return d.value
-        return self.defaults.get(key.lower(), "<unknown>")
+        return self.defaults.get(_canonical_key(key), "<unknown>")
 
     def _add(self, severity, directive, value, message, detail, refs,
              match_scope=None, at=None):
@@ -657,7 +725,7 @@ class RuleEngine:
         always parses, so no finding is raised for that case.
         """
         d   = self._get_directive(key)
-        raw = d.value if d else self.defaults.get(key.lower())
+        raw = d.value if d else self.defaults.get(_canonical_key(key))
         if raw is None:
             return None
         try:
@@ -675,7 +743,7 @@ class RuleEngine:
         valid 'LoginGraceTime 10m' was never evaluated at all.
         """
         d   = self._get_directive(key)
-        raw = d.value if d else self.defaults.get(key.lower())
+        raw = d.value if d else self.defaults.get(_canonical_key(key))
         if raw is None:
             return None
         seconds = _parse_time(raw)
@@ -726,7 +794,7 @@ class RuleEngine:
         would surface as a CRITICAL 'unreadable file' -- a false alarm on a
         very common layout.
         """
-        for pattern, dir_path, lineno in self.parser.include_dirs:
+        for pattern, dir_path, src, lineno in self.parser.include_dirs:
             self.findings.append(Finding(
                 severity=Severity.LOW,
                 directive="Include",
@@ -744,7 +812,7 @@ class RuleEngine:
                 ),
                 references=[self.MAN_REF],
                 line=lineno,
-                source=self.parser.path,
+                source=src,
             ))
 
     def rule_00_empty_includes(self):
@@ -755,7 +823,7 @@ class RuleEngine:
         pattern has a typo -- either way, whatever directives were meant to
         live in those files are silently absent from this report.
         """
-        for pattern, lineno in self.parser.empty_includes:
+        for pattern, src, lineno in self.parser.empty_includes:
             self.findings.append(Finding(
                 severity=Severity.INFO,
                 directive="Include",
@@ -769,7 +837,7 @@ class RuleEngine:
                 ),
                 references=[self.MAN_REF],
                 line=lineno,
-                source=self.parser.path,
+                source=src,
             ))
 
     def rule_00_unparsed_lines(self):
@@ -863,15 +931,21 @@ class RuleEngine:
         # same option. Checking only the old name meant every config written
         # against a modern server slipped past this rule entirely.
         key, d = self._get_directive_any(
-            "ChallengeResponseAuthentication",
             "KbdInteractiveAuthentication",
+            "ChallengeResponseAuthentication",
         )
         val = (d.value if d else
-               self.defaults["challengeresponseauthentication"]).lower()
+               self.defaults["kbdinteractiveauthentication"]).lower()
+        # The compiled-in default is 'yes', but without PAM (or BSD auth)
+        # there are no keyboard-interactive devices on Linux, so an implicit
+        # 'yes' only matters when UsePAM is on. An explicit 'yes' is always
+        # reported: it states intent, and UsePAM may be set elsewhere.
+        if d is None and self._effective_value("UsePAM").lower() != "yes":
+            return
         if val == "yes":
             self._add(
                 Severity.MEDIUM,
-                key, val,
+                key, val if d else f"{val} (compiled-in default)",
                 "Challenge-response authentication is enabled.",
                 (
                     "Unless you specifically need TOTP or PAM challenge-response, "

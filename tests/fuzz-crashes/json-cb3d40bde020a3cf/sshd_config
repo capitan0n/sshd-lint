@@ -1,0 +1,21 @@
+StrictModes  no
+Match User fuzz Address 127.0.0.1
+    RevokedKeys 2
+    GSSAPICleanupCredentials	0
+CASignatureAlgorithms 22
+Match User fuzz Address 127.0.0.1
+    Compression No
+    AuthorizedKeysFile yes	no
+    UsePAM yes 
+    Port 10
+GSSAPIAuthentication y e s
+# 
+UseDNS YES
+
+AcceptEnv 
+MACs true
+Match User *
+    Compression YES
+LogLevel No
+KexAlgorithms 22
+TrustedUserCAKeys	10
