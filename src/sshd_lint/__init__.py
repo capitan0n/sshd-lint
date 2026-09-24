@@ -150,6 +150,89 @@ def _strip_comment(line: str) -> str:
     return line
 
 
+def _sshd_lines(text: str):
+    """Yield (lineno, line) the way sshd's load_server_config() reads them.
+
+    sshd uses getline(), so only '\\n' ends a line. str.splitlines() also
+    breaks on '\\r', '\\f', '\\v', U+0085, U+2028 and others, which let a
+    comment such as '# note<U+2028>PermitRootLogin no' plant a directive
+    only the linter saw -- shadowing the real 'PermitRootLogin yes' below
+    it. sshd also copies each line with strlen(), so a NUL ends the line
+    and drops its newline: what follows is appended to the next line.
+    Leading ' \\t\\r' is stripped per physical line, as sshd does.
+    """
+    pending, start = "", 0
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        if not pending:
+            start = lineno
+        raw = raw.lstrip(" \t\r")
+        nul = raw.find("\0")
+        if nul != -1:
+            pending += raw[:nul]
+            continue
+        yield start, pending + raw
+        pending = ""
+    if pending:
+        yield start, pending
+
+
+def _unquote_keyword(line: str) -> str:
+    """Drop the quotes sshd's strdelim() accepts around the keyword.
+
+    '"PermitRootLogin" yes' and 'Permit"RootLogin" yes' are both read by
+    sshd as PermitRootLogin, but neither matched DIRECTIVE_RE, so the line
+    was only a LOW "unparsed" finding. An unterminated quote is left alone:
+    sshd ignores that line, and it stays reported as unparsed here.
+    """
+    i = 0
+    while i < len(line) and line[i] not in ' \t"=':
+        i += 1
+    if i == len(line) or line[i] != '"':
+        return line
+    j = line.find('"', i + 1)
+    if j == -1:
+        return line
+    return (line[:i] + line[i + 1:j] + " " + line[j + 1:]).strip()
+
+
+def _argv_split(s: str) -> Optional[list[str]]:
+    """Split arguments like OpenSSH's argv_split(), or None on a bad quote.
+
+    sshd removes single and double quotes anywhere in a word and honours
+    backslash escapes, so 'yes', "y"es and ye""s all mean yes to it.
+    Returns None for an unterminated quote, which sshd rejects.
+    """
+    args: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] in " \t":
+            i += 1
+            continue
+        arg: list[str] = []
+        quote = ""
+        while i < n:
+            c = s[i]
+            if c == "\\" and i + 1 < n and (
+                s[i + 1] in "'\"\\" or (not quote and s[i + 1] == " ")
+            ):
+                arg.append(s[i + 1])
+                i += 2
+                continue
+            if not quote and c in " \t":
+                break
+            if not quote and c in "'\"":
+                quote = c
+            elif quote and c == quote:
+                quote = ""
+            else:
+                arg.append(c)
+            i += 1
+        if quote:
+            return None
+        args.append("".join(arg))
+    return args
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -258,15 +341,16 @@ class SshdConfigParser:
 
     @staticmethod
     def _unquote(value: str) -> str:
-        """Strip surrounding double quotes from a fully-quoted value.
+        """Remove quoting from a single-argument value as sshd does.
 
-        sshd accepts `Banner "/etc/issue.net"`.  Only a value quoted as a
-        whole is unwrapped; `AllowUsers "user one" two` is left alone, since
-        stripping there would corrupt the argument list.
+        sshd accepts `Banner "/etc/issue.net"`, and also `'yes'` or `"y"es`
+        (see _argv_split). Only a value that is one argument is unwrapped;
+        `AllowUsers "user one" two` is left alone, since joining it would
+        corrupt the argument list.
         """
-        if len(value) >= 2 and value[0] == '"' and value[-1] == '"' \
-                and value.count('"') == 2:
-            return value[1:-1]
+        args = _argv_split(value)
+        if args is not None and len(args) == 1:
+            return args[0]
         return value
 
     def _parse_file(self, path: Path):
@@ -275,13 +359,16 @@ class SshdConfigParser:
         self._visited.add(path)
 
         try:
-            lines = path.read_text(errors="replace").splitlines()
+            # newline="" keeps a lone '\r' in place: sshd does not treat it
+            # as a line break, so neither may the linter.
+            with path.open(errors="replace", newline="") as fh:
+                text = fh.read()
         except OSError as exc:
             self.parse_errors.append((path, str(exc)))
             return
 
-        for lineno, raw in enumerate(lines, start=1):
-            line = _strip_comment(raw.strip())
+        for lineno, raw in _sshd_lines(text):
+            line = _unquote_keyword(_strip_comment(raw.strip()))
 
             if not line:
                 continue
@@ -305,8 +392,11 @@ class SshdConfigParser:
             if m:
                 # sshd_config(5): "Multiple pathnames may be specified" on a
                 # single Include line -- each is its own glob(7) pattern.
-                for include_glob in m.group(1).split():
-                    include_glob = self._unquote(include_glob)
+                # Split like sshd, so a quoted path with spaces stays whole.
+                include_globs = _argv_split(m.group(1))
+                if include_globs is None:
+                    include_globs = [self._unquote(g) for g in m.group(1).split()]
+                for include_glob in include_globs:
                     try:
                         if Path(include_glob).is_absolute():
                             root, pattern = Path('/'), include_glob.lstrip('/')
@@ -1675,6 +1765,20 @@ def _colorize(text: str, severity: Severity, use_color: bool) -> str:
     return f"{SEVERITY_COLOR[severity]}{text}{RESET}"
 
 
+# C0/C1 control characters except tab and newline.
+_CONTROL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
+
+
+def _printable(text) -> str:
+    """Escape control characters that came from the audited files.
+
+    A config audited offline may come from an untrusted machine, and sshd
+    accepts escape sequences in values such as a Match condition. Printed
+    raw, '\\x1b[2J' clears the terminal and hides the findings above it.
+    """
+    return _CONTROL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
 def _location(f: Finding, main_config: Optional[Path]) -> str:
     """Render a finding's location.
 
@@ -1700,17 +1804,17 @@ def report_text(findings: list[Finding],
     lines = []
     for f in findings:
         sev = _colorize(f"[{f.severity.value}]", f.severity, use_color)
-        loc = _location(f, main_config)
+        loc = _printable(_location(f, main_config))
         scope_tag = (
-            _colorize(f" [Match: {f.match_scope}]", Severity.INFO, use_color)
+            _colorize(f" [Match: {_printable(f.match_scope)}]", Severity.INFO, use_color)
             if f.match_scope else ""
         )
 
-        lines.append(f"{sev} {f.directive}{loc}{scope_tag}")
-        lines.append(f"  Current value : {f.value}")
-        lines.append(f"  Issue         : {f.message}")
+        lines.append(f"{sev} {_printable(f.directive)}{loc}{scope_tag}")
+        lines.append(f"  Current value : {_printable(f.value)}")
+        lines.append(f"  Issue         : {_printable(f.message)}")
         if not compact:
-            lines.append(f"  Why it matters: {f.detail}")
+            lines.append(f"  Why it matters: {_printable(f.detail)}")
             if f.references:
                 lines.append(f"  References    : {' | '.join(f.references)}")
         lines.append("")
@@ -1951,7 +2055,7 @@ def _run():
 
     if args.format == "text":
         by_sev = {s: sum(1 for f in findings if f.severity == s) for s in Severity}
-        print(f"\nsshd_lint {__version__} — {config_path}")
+        print(f"\nsshd_lint {__version__} — {_printable(config_path)}")
         print(f"{'─' * 60}")
         print(
             f"Findings: {len(findings)}  "
