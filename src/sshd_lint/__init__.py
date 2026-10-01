@@ -28,6 +28,7 @@ References used in rules:
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -98,8 +99,8 @@ CUMULATIVE_DIRECTIVES = {
     "port",
     # One Subsystem line per subsystem name (e.g. sftp, netconf)
     "subsystem",
-    # SetEnv accumulates environment variable assignments
-    "setenv",
+    # NOT setenv: servconf.c keeps only the first SetEnv line
+    # ("if (!*activep || uvalue != 0) continue").
     # Match is a block header, handled separately by the parser
     "match",
     # sshd_config(5): each of these "may appear multiple times ... with
@@ -109,6 +110,37 @@ CUMULATIVE_DIRECTIVES = {
     "allowgroups",
     "denyusers",
     "denygroups",
+}
+
+# servconf.c assigns these on every occurrence, without the usual first-wins
+# check, so the LAST one is what sshd uses. Verified with `sshd -T`.
+LAST_WINS_DIRECTIVES = {"fingerprinthash", "ipqos", "maxstartups"}
+
+# Keywords allowed inside a Match block (SSHCFG_ALL in servconf.c, OpenSSH
+# 9.6), by canonical name. sshd re-reads the config for every connection and
+# applies these, when they follow 'Match all', on top of the global values --
+# see SshdConfigParser.get_global().
+MATCH_DIRECTIVES = {
+    "acceptenv", "allowagentforwarding", "allowgroups",
+    "allowstreamlocalforwarding", "allowtcpforwarding", "allowusers",
+    "authenticationmethods", "authorizedkeyscommand",
+    "authorizedkeyscommanduser", "authorizedkeysfile",
+    "authorizedprincipalscommand", "authorizedprincipalscommanduser",
+    "authorizedprincipalsfile", "banner", "casignaturealgorithms",
+    "channeltimeout", "chrootdirectory", "clientalivecountmax",
+    "clientaliveinterval", "denygroups", "denyusers", "disableforwarding",
+    "exposeauthinfo", "forcecommand", "gatewayports", "gssapiauthentication",
+    "hostbasedacceptedalgorithms", "hostbasedauthentication",
+    "hostbasedusesnamefrompacketonly", "ignorerhosts", "ipqos",
+    "kbdinteractiveauthentication", "kerberosauthentication", "loglevel",
+    "logverbose", "maxauthtries", "maxsessions", "passwordauthentication",
+    "permitemptypasswords", "permitlisten", "permitopen", "permitrootlogin",
+    "permittty", "permittunnel", "permituserrc", "pubkeyacceptedalgorithms",
+    "pubkeyauthentication", "pubkeyauthoptions", "rdomain", "rekeylimit",
+    "requiredrsasize", "revokedkeys", "setenv", "streamlocalbindmask",
+    "streamlocalbindunlink", "subsystem", "trustedusercakeys",
+    "unusedconnectiontimeout", "x11displayoffset", "x11forwarding",
+    "x11uselocalhost",
 }
 
 # ---------------------------------------------------------------------------
@@ -233,6 +265,48 @@ def _argv_split(s: str) -> Optional[list[str]]:
     return args
 
 
+_STRDELIM_RE = re.compile(r'[ \t\r\n"=]')
+
+
+def _strdelim(s: str) -> tuple[Optional[str], Optional[str]]:
+    """Split one word off s like OpenSSH's strdelim(), which reads Match.
+
+    Returns (word, rest). rest is None once the line is used up; word is
+    None for an unterminated quote. Only double quotes are special, and a
+    single '=' separates words just like whitespace.
+    """
+    m = _STRDELIM_RE.search(s)
+    if m is None:
+        return s, None
+    i = m.start()
+    if s[i] == '"':
+        s = s[:i] + s[i + 1:]
+        j = s.find('"', i)
+        if j == -1:
+            return None, None
+        return s[:j], s[j + 1:].lstrip(" \t\r\n")
+    rest = s[i + 1:].lstrip(" \t\r\n")
+    if s[i] != "=" and rest.startswith("="):
+        rest = rest[1:].lstrip(" \t\r\n")
+    return s[:i], rest
+
+
+def _match_is_all(condition: str) -> bool:
+    """True if sshd reads this Match condition as 'all'.
+
+    match_cfg_line() takes the first word via strdelim(), so 'Match "all"'
+    is 'all' too; only a comment may follow it. Comparing the raw string
+    missed that, and left every later line scoped to a Match named '"all"'.
+    """
+    attrib, rest = _strdelim(condition)
+    if attrib is None or attrib.lower() != "all":
+        return False
+    if rest is None:
+        return True
+    arg, _ = _strdelim(rest)
+    return not arg or arg.startswith("#")
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -267,6 +341,10 @@ class ParsedDirective:
     source:          Optional[Path] = None
     in_match:        bool = False
     match_condition: str  = ""
+    # A global directive that follows 'Match all'. sshd re-reads the config
+    # for every connection and applies such lines on top of the global
+    # values -- see SshdConfigParser.get_global().
+    after_match_all: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +368,21 @@ class SshdConfigParser:
 
     Note on Match + Include
     -----------------------
-    The active Match context is parser-wide state, NOT per-file state.  This
-    mirrors OpenSSH: servconf.c passes a single shared `activep` pointer down
-    into included files, so an Include inside a Match block is processed under
-    that Match, and a Match opened inside an included file stays open after
-    control returns to the parent file.  That second half is a genuine
-    footgun -- it is why distributions place the `Include sshd_config.d/*.conf`
-    line at the very TOP of sshd_config -- and modelling it per-file here
-    would silently mis-scope findings.
+    An Include inside a Match block is processed under that Match: servconf.c
+    passes its `activep` pointer down into the included file. It also saves
+    that state before the Include and restores it afterwards ("Don't let
+    included files clobber the containing file's Match state"), so a Match
+    opened inside an included file ends with that file and does NOT scope the
+    rest of the parent. A 'Match all' inside a file included from a Match
+    block returns to that enclosing Match, not to global scope.
+
+    Note on Match all
+    -----------------
+    sshd re-reads the whole config for every connection and applies, on top
+    of the global values, the matching Match blocks and every line after a
+    'Match all'. So for keywords allowed in a Match block, a line after
+    'Match all' overrides an earlier global line instead of being shadowed
+    by it. Verified with `sshd -T` (OpenSSH 9.6).
     """
 
     DIRECTIVE_RE = re.compile(
@@ -314,11 +399,16 @@ class SshdConfigParser:
     # offline audit walk a large chunk of the filesystem.
     MAX_INCLUDE_MATCHES = 500
 
+    # sshd refuses to start past this Include nesting depth
+    # (SERVCONF_MAX_DEPTH in servconf.c).
+    MAX_INCLUDE_DEPTH = 16
+
     def __init__(self, path: Path, base_dir: Path):
         self.path        = path
         self.base_dir    = base_dir
         self.directives: list[ParsedDirective]            = []
-        self._visited:   set[Path]                        = set()
+        # (file, Match state it was parsed under) -- see _parse_file().
+        self._visited:   set[tuple[Path, bool, str, bool]] = set()
         self.parse_errors: list[tuple[Path, str]]         = []
         # Include patterns that matched zero files -- see rule_00_empty_includes.
         self.empty_includes: list[tuple[str, Path, int]]  = []
@@ -328,10 +418,14 @@ class SshdConfigParser:
         # Include globs that matched a directory -- see rule_00_include_dirs.
         self.include_dirs: list[tuple[str, Path, Path, int]] = []
         self._by_key: dict[str, list[ParsedDirective]]    = {}
-        # Active Match context. Parser-wide on purpose -- see the class
-        # docstring: OpenSSH shares this state across Include boundaries.
+        # Active Match context. An included file starts in its parent's
+        # state, which is restored when it ends -- see the class docstring.
         self._in_match        = False
         self._match_condition = ""
+        self._after_match_all = False
+        # Scope a 'Match all' returns to: global at the top level, the
+        # enclosing Match inside a file included from a Match block.
+        self._match_base: tuple[bool, str] = (False, "")
 
     def parse(self) -> list[ParsedDirective]:
         self._parse_file(self.path)
@@ -353,10 +447,16 @@ class SshdConfigParser:
             return args[0]
         return value
 
-    def _parse_file(self, path: Path):
-        if path in self._visited:
+    def _parse_file(self, path: Path, depth: int = 0):
+        # sshd reads a file again each time it is included, scoped by the
+        # Match state at that Include: a file pulled in under 'Match User x'
+        # and later globally applies globally too. Skipping only a repeat
+        # under the same state still keeps an Include loop finite.
+        key = (path, self._in_match, self._match_condition,
+               self._after_match_all)
+        if key in self._visited:
             return
-        self._visited.add(path)
+        self._visited.add(key)
 
         try:
             # newline="" keeps a lone '\r' in place: sshd does not treat it
@@ -379,9 +479,9 @@ class SshdConfigParser:
                 condition = m.group(1).strip()
                 # 'Match All' is a special keyword that ends any Match block
                 # and returns to global context (man sshd_config §Match)
-                if condition.lower() == "all":
-                    self._in_match        = False
-                    self._match_condition = ""
+                if _match_is_all(condition):
+                    self._in_match, self._match_condition = self._match_base
+                    self._after_match_all = not self._in_match
                 else:
                     self._in_match        = True
                     self._match_condition = condition
@@ -397,18 +497,28 @@ class SshdConfigParser:
                 if include_globs is None:
                     include_globs = [self._unquote(g) for g in m.group(1).split()]
                 for include_glob in include_globs:
+                    if not include_glob:
+                        self.parse_errors.append((
+                            Path(include_glob),
+                            "invalid Include pattern: empty argument",
+                        ))
+                        continue
+                    if Path(include_glob).is_absolute():
+                        pattern = include_glob
+                    else:
+                        pattern = os.path.join(
+                            glob.escape(str(self.base_dir)), include_glob
+                        )
                     try:
-                        if Path(include_glob).is_absolute():
-                            root, pattern = Path('/'), include_glob.lstrip('/')
-                        else:
-                            root, pattern = self.base_dir, include_glob
+                        # glob.glob, not Path.glob: it follows glob(3), which
+                        # sshd uses -- '**' is a plain '*' rather than a
+                        # recursive walk, and '*' does not match a leading
+                        # '.'. Sorted by bytes, as glob(3) sorts whole paths.
                         matched = sorted(
-                            p for p in root.glob(pattern)
-                            if not self._hidden_mismatch(p, root, pattern)
+                            (Path(p) for p in glob.glob(pattern)),
+                            key=os.fsencode,
                         )
                     except (ValueError, OSError) as exc:
-                        # A malformed pattern (e.g. containing '..') makes
-                        # pathlib raise rather than return an empty list.
                         self.parse_errors.append((
                             Path(include_glob),
                             f"invalid Include pattern: {exc}",
@@ -436,11 +546,23 @@ class SshdConfigParser:
 
                     if not matched_paths:
                         self.empty_includes.append((include_glob, path, lineno))
+                    elif depth >= self.MAX_INCLUDE_DEPTH:
+                        # Recursing further would also overflow Python's
+                        # stack, and the traceback exited 1: a verdict code.
+                        self.parse_errors.append((
+                            Path(include_glob),
+                            f"Include nested more than "
+                            f"{self.MAX_INCLUDE_DEPTH} levels deep; sshd "
+                            f"refuses to start (\"Too many recursive "
+                            f"configuration includes\")",
+                        ))
+                        continue
 
                     for inc_path in matched_paths:
                         # resolve() so the same physical file reached via two
-                        # literal paths (e.g. a symlink) is parsed only once.
-                        self._parse_file(inc_path.resolve())
+                        # literal paths (e.g. a symlink) is parsed only once
+                        # per Match state.
+                        self._include(inc_path.resolve(), depth + 1)
                 continue
 
             # ---- Regular directive ------------------------------------------
@@ -453,41 +575,50 @@ class SshdConfigParser:
                     source=path,
                     in_match=self._in_match,
                     match_condition=self._match_condition,
+                    after_match_all=self._after_match_all,
                 ))
             else:
                 self.unparsed_lines.append((path, lineno, line))
 
-    @staticmethod
-    def _hidden_mismatch(p: Path, root: Path, pattern: str) -> bool:
-        """True if glob(3) -- which sshd uses -- would NOT match p.
+    def _include(self, path: Path, depth: int):
+        """Parse an included file under the current Match state.
 
-        glob(3) only matches a leading '.' in a path component when the
-        pattern component itself starts with '.'; pathlib's '*' matches
-        dotfiles too. Without this, a leftover '.old.conf' in
-        sshd_config.d/ was parsed even though sshd never reads it.
+        sshd saves the Match state before an Include and restores it after
+        ("Don't let included files clobber the containing file's Match
+        state", servconf.c), so a Match left open in the included file ends
+        with it. Letting it leak scoped the parent's later lines -- e.g. a
+        global 'PermitRootLogin yes' -- to that Match instead of globally.
         """
-        pat_parts = Path(pattern).parts
-        for i, part in enumerate(p.relative_to(root).parts):
-            if part.startswith('.'):
-                if i >= len(pat_parts) or not pat_parts[i].startswith('.'):
-                    return True
-        return False
+        saved = (self._in_match, self._match_condition,
+                 self._after_match_all, self._match_base)
+        self._match_base = (self._in_match, self._match_condition)
+        try:
+            self._parse_file(path, depth)
+        finally:
+            (self._in_match, self._match_condition,
+             self._after_match_all, self._match_base) = saved
 
     # ------------------------------------------------------------------
     # Query helpers
     # ------------------------------------------------------------------
 
     def get_global(self, key: str) -> Optional[ParsedDirective]:
-        """Return the FIRST global (non-Match) directive with the given key.
+        """Return the global (non-Match) directive sshd actually uses.
 
-        This mirrors sshd's own behaviour: when a directive appears multiple
-        times in global scope, the first occurrence wins (except for
-        CUMULATIVE_DIRECTIVES, which callers handle separately).
+        Normally the FIRST global occurrence wins (CUMULATIVE_DIRECTIVES are
+        handled separately by callers), with two exceptions sshd -T confirms:
+          - LAST_WINS_DIRECTIVES keep their last occurrence;
+          - for a keyword allowed in a Match block, a line after 'Match all'
+            is re-applied to every connection and overrides any global line,
+            so the first such line wins over the ones before 'Match all'.
         """
-        for d in self._by_key.get(_canonical_key(key), ()):
-            if not d.in_match:
-                return d
-        return None
+        k = _canonical_key(key)
+        found = [d for d in self._by_key.get(k, ()) if not d.in_match]
+        if not found:
+            return None
+        if k in MATCH_DIRECTIVES:
+            found = [d for d in found if d.after_match_all] or found
+        return found[-1] if k in LAST_WINS_DIRECTIVES else found[0]
 
     def get_global_all(self, key: str) -> list[ParsedDirective]:
         """Return ALL global occurrences of a directive (for duplicate detection)."""
@@ -501,14 +632,14 @@ class SshdConfigParser:
     def get_shadowed_globals(self) -> list[tuple[ParsedDirective, ParsedDirective]]:
         """Return (winner, shadowed) pairs for duplicate global directives.
 
-        sshd silently ignores every global occurrence of a directive beyond
-        the first.  This method finds those shadowed lines so we can warn
-        the operator.
+        sshd silently ignores every global occurrence of a directive except
+        the one get_global() returns.  This method finds those shadowed lines
+        so we can warn the operator.
 
         Cumulative directives (see CUMULATIVE_DIRECTIVES) are excluded because
         sshd genuinely uses all of their occurrences.
         """
-        seen:     dict[str, ParsedDirective]                         = {}
+        winners:  dict[str, Optional[ParsedDirective]]               = {}
         shadowed: list[tuple[ParsedDirective, ParsedDirective]]      = []
 
         for d in self.directives:
@@ -517,10 +648,11 @@ class SshdConfigParser:
             k = _canonical_key(d.key)
             if k in CUMULATIVE_DIRECTIVES:
                 continue
-            if k in seen:
-                shadowed.append((seen[k], d))
-            else:
-                seen[k] = d
+            if k not in winners:
+                winners[k] = self.get_global(k)
+            winner = winners[k]
+            if winner is not None and d is not winner:
+                shadowed.append((winner, d))
 
         return shadowed
 
@@ -699,6 +831,27 @@ def _parse_algorithm_directive(value: str) -> tuple[str, set[str]]:
         mode, rest = "replace", v
     algorithms = {a.strip().lower() for a in rest.split(',') if a.strip()}
     return mode, algorithms
+
+
+def _weak_algorithms(configured: set[str], weak: set[str]) -> set[str]:
+    """Entries of `configured` that name, or as a pattern select, a weak one.
+
+    HostKeyAlgorithms and PubkeyAcceptedAlgorithms accept '*' and '?'
+    wildcards, which sshd expands against every algorithm it supports, so
+    'ssh-*' or '+ssh-rsa*' enables ssh-rsa without spelling it out. Ciphers,
+    MACs and KexAlgorithms reject wildcards, so exact matching is enough there.
+    """
+    found = set()
+    for a in configured:
+        if "*" in a or "?" in a:
+            rx = re.compile(
+                re.escape(a).replace(r"\*", ".*").replace(r"\?", ".")
+            )
+            if any(rx.fullmatch(w) for w in weak):
+                found.add(a)
+        elif a in weak:
+            found.add(a)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1244,7 +1397,8 @@ class RuleEngine:
 
     def rule_21_tcp_forwarding(self):
         val = self._effective_value("AllowTcpForwarding").lower()
-        if val == "yes":
+        # sshd_config(5): 'all' is a synonym for 'yes'.
+        if val in ("yes", "all"):
             self._add(
                 Severity.LOW,
                 "AllowTcpForwarding", val,
@@ -1285,6 +1439,22 @@ class RuleEngine:
                     "With GatewayPorts yes, SSH -R tunnels listen on all network "
                     "interfaces instead of just localhost. This can unintentionally "
                     "expose internal services to external networks."
+                ),
+                [self.MAN_REF],
+            )
+        elif val == "clientspecified":
+            # Rule 55 already treats this as exposing inside a Match block;
+            # as a global setting it is the same risk.
+            self._add(
+                Severity.MEDIUM,
+                "GatewayPorts", val,
+                "GatewayPorts clientspecified — clients may bind "
+                "remote-forwarded ports to all interfaces.",
+                (
+                    "With GatewayPorts clientspecified, the client chooses the "
+                    "bind address of an SSH -R tunnel, including the wildcard "
+                    "address. This can unintentionally expose internal "
+                    "services to external networks."
                 ),
                 [self.MAN_REF],
             )
@@ -1414,7 +1584,7 @@ class RuleEngine:
         mode, configured = _parse_algorithm_directive(d.value)
         if mode == "remove":
             return
-        found_weak = configured & WEAK_HOSTKEY
+        found_weak = _weak_algorithms(configured, WEAK_HOSTKEY)
         if found_weak:
             self._add(
                 Severity.HIGH,
@@ -1441,7 +1611,7 @@ class RuleEngine:
         mode, configured = _parse_algorithm_directive(d.value)
         if mode == "remove":
             return
-        found_weak = configured & WEAK_HOSTKEY
+        found_weak = _weak_algorithms(configured, WEAK_HOSTKEY)
         if found_weak:
             self._add(
                 Severity.HIGH,
@@ -1641,7 +1811,7 @@ class RuleEngine:
                 "enables X11 forwarding for matched connections",
             ),
             "AllowTcpForwarding": (
-                {"yes", "local", "remote"},
+                {"yes", "all", "local", "remote"},
                 Severity.LOW,
                 "enables TCP forwarding for matched connections",
             ),
@@ -1700,6 +1870,17 @@ class RuleEngine:
                 winner_loc = f"{winner.source} line {winner.line}"
             else:
                 winner_loc = f"line {winner.line}"
+            k = _canonical_key(winner.key)
+            if k in LAST_WINS_DIRECTIVES:
+                rule = f"sshd uses the LAST occurrence of {winner.key}."
+            elif (k in MATCH_DIRECTIVES and winner.after_match_all
+                  and not shadowed.after_match_all):
+                rule = (
+                    "Lines after 'Match all' are re-applied to every "
+                    "connection and override the global value."
+                )
+            else:
+                rule = "sshd uses the FIRST occurrence of each directive."
             self.findings.append(Finding(
                 severity=Severity.MEDIUM,
                 directive=shadowed.key,
@@ -1709,7 +1890,7 @@ class RuleEngine:
                     f"(line {shadowed.line}) is IGNORED by sshd."
                 ),
                 detail=(
-                    f"sshd uses the FIRST occurrence of each directive. "
+                    f"{rule} "
                     f"The effective value is '{winner.value}' "
                     f"from {winner_loc}. "
                     f"The duplicate on line {shadowed.line} "
@@ -1765,8 +1946,10 @@ def _colorize(text: str, severity: Severity, use_color: bool) -> str:
     return f"{SEVERITY_COLOR[severity]}{text}{RESET}"
 
 
-# C0/C1 control characters except tab and newline.
-_CONTROL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
+# C0/C1 control characters except tab. Newline is escaped too: no finding
+# field contains one, but an included file's name can, and printed raw it
+# forged whole report lines.
+_CONTROL_RE = re.compile(r'[\x00-\x08\x0a-\x1f\x7f-\x9f]')
 
 
 def _printable(text) -> str:
@@ -1830,6 +2013,11 @@ def report_json(findings: list[Finding], exit_code: int) -> str:
                   consumers don't need to capture $? separately.
       summary   — per-severity counts for quick dashboard integration.
       findings  — the full list of findings.
+
+    JSON only requires U+0000-U+001F to be escaped, so with ensure_ascii off
+    a C1 control such as U+009B (CSI) from an audited file reached the
+    terminal raw. Those can only occur inside strings, where \\u escapes are
+    equivalent, so the output stays the same JSON document.
     """
     return json.dumps(
         {
@@ -1857,7 +2045,11 @@ def report_json(findings: list[Finding], exit_code: int) -> str:
         },
         indent=2,
         ensure_ascii=False,
-    )
+    ).translate(_JSON_C1_ESCAPES)
+
+
+# DEL and the C1 controls, as JSON \u escapes -- see report_json().
+_JSON_C1_ESCAPES = {c: f"\\u{c:04x}" for c in range(0x7f, 0xa0)}
 
 
 # ---------------------------------------------------------------------------

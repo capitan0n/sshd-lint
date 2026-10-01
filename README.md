@@ -31,8 +31,8 @@ with enough parsing fidelity to model the parts of OpenSSH's semantics that actu
   directives, trailing `#` comments, and `Include` glob expansion with `glob(3)` rules
   (hidden files are not matched by `*`).
 - **Match state threaded through includes.** An `Include` inside a `Match` block is analyzed
-  under that block, and a `Match` opened inside an included file stays open after control
-  returns — mirroring how sshd itself behaves.
+  under that block, and a `Match` opened inside an included file ends with that file, since
+  sshd restores the parent's Match state after every `Include`.
 - **Findings are located, not just numbered.** Every finding carries the file it came from,
   so a line number still means something once `Include` is in play.
 - **Scoped Match block findings.** Distinguishes global misconfigurations from risks that
@@ -161,15 +161,18 @@ $ sshd-lint /etc/ssh/sshd_config --severity high --compact
                   allows password login for matched connections, bypassing the global 'no'.
 ```
 
-Two behaviours are worth knowing, because both mirror real sshd semantics rather than
-intuition:
+Three behaviours are worth knowing, because all of them mirror real sshd semantics (checked
+with `sshd -T`) rather than intuition:
 
 - An `Include` **inside** a `Match` block is processed under that block. Directives in the
   included file inherit the scope.
-- A `Match` opened **inside** an included file stays open after the include returns, and so
-  scopes the remainder of the parent file. This is a genuine OpenSSH footgun, and it is why
-  distributions place the `Include sshd_config.d/*.conf` line at the very **top** of
-  `sshd_config`, before any `Match` block can be active.
+- A `Match` opened **inside** an included file ends with that file. sshd saves the Match state
+  before an `Include` and restores it afterwards, so the rest of the parent file keeps the
+  scope it had before the `Include`.
+- A line after `Match all` is not just global: sshd re-reads the configuration for every
+  connection and applies such lines on top of the global values. For any keyword allowed in a
+  `Match` block, `PermitRootLogin yes` after `Match all` therefore overrides an earlier
+  `PermitRootLogin no` — it is not the shadowed duplicate that first-wins would suggest.
 
 ---
 
@@ -308,7 +311,8 @@ command.
 
 ### Parse and file handling
 - **Rule 00** — Include resolution problems: unreadable files (CRITICAL), a glob matching
-  more than 500 files (CRITICAL, refused outright), a glob matching a directory (LOW,
+  more than 500 files (CRITICAL, refused outright), includes nested more than 16 levels deep
+  (CRITICAL, sshd refuses to start), a glob matching a directory (LOW,
   skipped), a glob matching zero files (INFO), and lines that could not be parsed as a
   directive (LOW).
 
@@ -459,11 +463,10 @@ The two drop-ins demonstrate the two scenarios the analyzer is built to get righ
   authentication globally, and this drop-in re-enables it for a single automation account
   inside a `Match User` block. The finding must be scoped to that user and attributed to
   this file, not reported as a server-wide regression.
-- **`20-danger.conf`** — the footgun. It opens a `Match Address` block and never closes it.
-  Because sshd shares Match state across `Include` boundaries, the block remains active when
-  control returns to `edge.conf`, so the directives near the end of the *parent* file are
-  silently scoped to that address range rather than being global. The analyzer surfaces this
-  by scoping those trailing findings to the leaked Match condition.
+- **`20-danger.conf`** — the unclosed block. It opens a `Match Address` block and never
+  closes it. sshd restores the parent's Match state when an `Include` returns, so the block
+  ends with this file: the directives near the end of the *parent* file stay **global**, and
+  the analyzer must report them as server-wide findings, not scoped to that address range.
 
 Run them with:
 

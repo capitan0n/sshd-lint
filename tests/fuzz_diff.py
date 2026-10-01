@@ -751,7 +751,9 @@ def main() -> int:
                     help="RNG seed; runs are fully reproducible")
     ap.add_argument("--target", default=DEFAULT_TARGET,
                     help=f"how to invoke the linter (default: {DEFAULT_TARGET!r})")
-    ap.add_argument("--json-flag", default="--json",
+    # sshd-lint has no --json: with it every run exited 64, which the
+    # oracles skip as "refused to analyse", so the fuzzer passed vacuously.
+    ap.add_argument("--json-flag", default="--format=json",
                     help="flag that selects JSON output")
     ap.add_argument("--corpus", action="append", default=[],
                     help="seed file or directory; repeatable")
