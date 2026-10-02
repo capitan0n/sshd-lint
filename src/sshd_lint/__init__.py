@@ -38,7 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 # Raw string: the art contains backslashes that must not be read as escapes.
 # Kept at 51 columns so it never wraps on an 80-column terminal.
