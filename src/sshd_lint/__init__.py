@@ -50,8 +50,8 @@ BANNER = r"""
 |___/ |___/ |_| |_| \__,_| _____ |_||_||_| |_| \__|
 """
 
-if sys.version_info < (3, 9):
-    sys.exit("Error: sshd_lint requires Python 3.9 or newer.")
+if sys.version_info < (3, 10):
+    sys.exit("Error: sshd_lint requires Python 3.10 or newer.")
 
 
 # ---------------------------------------------------------------------------

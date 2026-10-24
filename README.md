@@ -49,7 +49,7 @@ with enough parsing fidelity to model the parts of OpenSSH's semantics that actu
 
 ## Requirements
 
-- Python 3.9 or newer
+- Python 3.10 or newer
 - No external packages — the standard library only
 - Linux or BSD (the tool relies on POSIX conventions; Windows is not supported)
 
